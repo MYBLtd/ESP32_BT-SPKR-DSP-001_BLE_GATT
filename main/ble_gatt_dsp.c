@@ -1,0 +1,508 @@
+/*
+ * BLE GATT DSP Control Service Implementation
+ * FSD-DSP-001: DSP Control via BLE GATT
+ *
+ * Author: Robin Kluit
+ * Date: 2026-01-20
+ */
+
+#include "ble_gatt_dsp.h"
+#include <string.h>
+#include "esp_log.h"
+#include "esp_bt.h"
+#include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
+#include "esp_bt_defs.h"
+#include "esp_bt_main.h"
+
+static const char *TAG = "BLE_GATT";
+
+/* GATT profile instance */
+#define DSP_PROFILE_NUM     1
+#define DSP_PROFILE_APP_ID  0
+
+/* Attribute indexes */
+enum {
+    IDX_SVC,                    /* Service declaration */
+    IDX_CTRL_CHAR,              /* Control characteristic declaration */
+    IDX_CTRL_VAL,               /* Control characteristic value */
+    IDX_STATUS_CHAR,            /* Status characteristic declaration */
+    IDX_STATUS_VAL,             /* Status characteristic value */
+    IDX_STATUS_CCC,             /* Status Client Characteristic Configuration */
+    IDX_NB,                     /* Number of attributes */
+};
+
+/* Service UUID */
+static const uint8_t dsp_service_uuid[16] = DSP_SERVICE_UUID_128;
+
+/* Characteristic UUIDs */
+static const uint8_t dsp_control_uuid[16] = DSP_CONTROL_CHAR_UUID_128;
+static const uint8_t dsp_status_uuid[16] = DSP_STATUS_CHAR_UUID_128;
+
+/* Characteristic properties */
+static const uint8_t ctrl_char_prop = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR;
+static const uint8_t status_char_prop = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+
+/* Client Characteristic Configuration Descriptor default value */
+static uint8_t status_ccc[2] = {0x00, 0x00};
+
+/* Control characteristic value (2 bytes: CMD + VAL) */
+static uint8_t ctrl_value[2] = {0x00, 0x00};
+
+/* Status characteristic value (4 bytes per Section 10.4) */
+static uint8_t status_value[DSP_STATUS_SIZE] = {
+    DSP_STATUS_PROTOCOL_VERSION,    /* VER */
+    0x00,                           /* PRESET */
+    0x00,                           /* LOUDNESS */
+    0x01                            /* FLAGS (limiter active) */
+};
+
+/* GATT attribute table */
+static const esp_gatts_attr_db_t gatt_db[IDX_NB] = {
+    /* Service Declaration */
+    [IDX_SVC] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_PRI_SERVICE},
+            ESP_GATT_PERM_READ,
+            sizeof(dsp_service_uuid), sizeof(dsp_service_uuid), (uint8_t *)dsp_service_uuid
+        }
+    },
+
+    /* Control Characteristic Declaration */
+    [IDX_CTRL_CHAR] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_CHAR_DECLARE},
+            ESP_GATT_PERM_READ,
+            sizeof(uint8_t), sizeof(uint8_t), (uint8_t *)&ctrl_char_prop
+        }
+    },
+
+    /* Control Characteristic Value */
+    [IDX_CTRL_VAL] = {
+        {ESP_GATT_RSP_BY_APP},  /* Manual response for write handling */
+        {
+            ESP_UUID_LEN_128, (uint8_t *)dsp_control_uuid,
+            ESP_GATT_PERM_WRITE,
+            sizeof(ctrl_value), sizeof(ctrl_value), ctrl_value
+        }
+    },
+
+    /* Status Characteristic Declaration */
+    [IDX_STATUS_CHAR] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_CHAR_DECLARE},
+            ESP_GATT_PERM_READ,
+            sizeof(uint8_t), sizeof(uint8_t), (uint8_t *)&status_char_prop
+        }
+    },
+
+    /* Status Characteristic Value */
+    [IDX_STATUS_VAL] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_128, (uint8_t *)dsp_status_uuid,
+            ESP_GATT_PERM_READ,
+            sizeof(status_value), sizeof(status_value), status_value
+        }
+    },
+
+    /* Status Client Characteristic Configuration Descriptor */
+    [IDX_STATUS_CCC] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_CHAR_CLIENT_CONFIG},
+            ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+            sizeof(status_ccc), sizeof(status_ccc), status_ccc
+        }
+    },
+};
+
+/* Advertising data */
+static esp_ble_adv_data_t adv_data = {
+    .set_scan_rsp = false,
+    .include_name = true,
+    .include_txpower = false,
+    .min_interval = 0x0006,     /* 7.5ms */
+    .max_interval = 0x0010,     /* 20ms */
+    .appearance = 0x0841,       /* Speaker appearance */
+    .manufacturer_len = 0,
+    .p_manufacturer_data = NULL,
+    .service_data_len = 0,
+    .p_service_data = NULL,
+    .service_uuid_len = 0,
+    .p_service_uuid = NULL,
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+};
+
+/* Scan response data */
+static esp_ble_adv_data_t scan_rsp_data = {
+    .set_scan_rsp = true,
+    .include_name = true,
+    .include_txpower = true,
+    .appearance = 0x0841,
+    .manufacturer_len = 0,
+    .p_manufacturer_data = NULL,
+    .service_data_len = 0,
+    .p_service_data = NULL,
+    .service_uuid_len = sizeof(dsp_service_uuid),
+    .p_service_uuid = (uint8_t *)dsp_service_uuid,
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+};
+
+/* Advertising parameters */
+static esp_ble_adv_params_t adv_params = {
+    .adv_int_min = BLE_ADV_INTERVAL_MIN,
+    .adv_int_max = BLE_ADV_INTERVAL_MAX,
+    .adv_type = ADV_TYPE_IND,
+    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .channel_map = ADV_CHNL_ALL,
+    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+};
+
+/* BLE state */
+typedef struct {
+    uint16_t gatts_if;
+    uint16_t conn_id;
+    uint16_t handle_table[IDX_NB];
+    bool connected;
+    bool notifications_enabled;
+    ble_dsp_settings_cb_t settings_cb;
+} ble_state_t;
+
+static ble_state_t s_ble = {
+    .gatts_if = ESP_GATT_IF_NONE,
+    .conn_id = 0xFFFF,
+    .connected = false,
+    .notifications_enabled = false,
+    .settings_cb = NULL,
+};
+
+/* Forward declarations */
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
+                                esp_ble_gatts_cb_param_t *param);
+static void handle_control_write(const uint8_t *data, uint16_t len);
+static void update_status_value(void);
+
+/*
+ * GAP event handler
+ */
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
+        ESP_LOGD(TAG, "Advertising data set complete");
+        break;
+
+    case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
+        ESP_LOGD(TAG, "Scan response data set complete");
+        break;
+
+    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+        if (param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGI(TAG, "BLE advertising started");
+        } else {
+            ESP_LOGE(TAG, "BLE advertising start failed: %d", param->adv_start_cmpl.status);
+        }
+        break;
+
+    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+        if (param->adv_stop_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGI(TAG, "BLE advertising stopped");
+        }
+        break;
+
+    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+        ESP_LOGD(TAG, "Connection params updated: interval=%d, latency=%d, timeout=%d",
+                 param->update_conn_params.conn_int,
+                 param->update_conn_params.latency,
+                 param->update_conn_params.timeout);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/*
+ * Handle control write commands (Section 10.3)
+ */
+static void handle_control_write(const uint8_t *data, uint16_t len)
+{
+    if (len < 2) {
+        ESP_LOGW(TAG, "Control write too short: %d bytes", len);
+        return;
+    }
+
+    uint8_t cmd = data[0];
+    uint8_t val = data[1];
+
+    ESP_LOGI(TAG, "Control command: CMD=0x%02X, VAL=0x%02X", cmd, val);
+
+    bool settings_changed = false;
+
+    switch (cmd) {
+    case DSP_CMD_SET_PRESET:
+        if (val < DSP_PRESET_COUNT) {
+            dsp_set_preset((dsp_preset_t)val);
+            settings_changed = true;
+            ESP_LOGI(TAG, "Preset set to: %s", dsp_preset_name((dsp_preset_t)val));
+        } else {
+            ESP_LOGW(TAG, "Invalid preset value: %d", val);
+        }
+        break;
+
+    case DSP_CMD_SET_LOUDNESS:
+        dsp_set_loudness(val != 0);
+        settings_changed = true;
+        ESP_LOGI(TAG, "Loudness set to: %s", val ? "ON" : "OFF");
+        break;
+
+    case DSP_CMD_GET_STATUS:
+        ESP_LOGI(TAG, "Status request received");
+        break;
+
+    default:
+        ESP_LOGW(TAG, "Unknown command: 0x%02X", cmd);
+        break;
+    }
+
+    /* Update status and notify */
+    update_status_value();
+    ble_gatt_dsp_notify_status();
+
+    /* Callback for NVS persistence */
+    if (settings_changed && s_ble.settings_cb != NULL) {
+        s_ble.settings_cb();
+    }
+}
+
+/*
+ * Update status characteristic value from DSP state
+ */
+static void update_status_value(void)
+{
+    dsp_status_t dsp_status;
+    dsp_get_status(&dsp_status);
+
+    status_value[0] = DSP_STATUS_PROTOCOL_VERSION;
+    status_value[1] = dsp_status.preset;
+    status_value[2] = dsp_status.loudness;
+    status_value[3] = dsp_status.flags;
+
+    /* Update the attribute value in GATT database */
+    if (s_ble.gatts_if != ESP_GATT_IF_NONE && s_ble.handle_table[IDX_STATUS_VAL] != 0) {
+        esp_ble_gatts_set_attr_value(s_ble.handle_table[IDX_STATUS_VAL],
+                                     sizeof(status_value), status_value);
+    }
+}
+
+/*
+ * GATTS event handler
+ */
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
+                                esp_ble_gatts_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_GATTS_REG_EVT:
+        if (param->reg.status == ESP_GATT_OK) {
+            ESP_LOGI(TAG, "GATT app registered, app_id=%d", param->reg.app_id);
+            s_ble.gatts_if = gatts_if;
+
+            /* Set device name for BLE */
+            esp_ble_gap_set_device_name(BLE_DEVICE_NAME);
+
+            /* Configure advertising data */
+            esp_ble_gap_config_adv_data(&adv_data);
+            esp_ble_gap_config_adv_data(&scan_rsp_data);
+
+            /* Create attribute table */
+            esp_err_t ret = esp_ble_gatts_create_attr_tab(gatt_db, gatts_if, IDX_NB, 0);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Create attr table failed: %s", esp_err_to_name(ret));
+            }
+        } else {
+            ESP_LOGE(TAG, "GATT app register failed, status=%d", param->reg.status);
+        }
+        break;
+
+    case ESP_GATTS_CREAT_ATTR_TAB_EVT:
+        if (param->add_attr_tab.status == ESP_GATT_OK) {
+            if (param->add_attr_tab.num_handle == IDX_NB) {
+                memcpy(s_ble.handle_table, param->add_attr_tab.handles,
+                       sizeof(s_ble.handle_table));
+                ESP_LOGI(TAG, "Attribute table created, handles=%d", param->add_attr_tab.num_handle);
+
+                /* Start GATT service */
+                esp_ble_gatts_start_service(s_ble.handle_table[IDX_SVC]);
+            }
+        } else {
+            ESP_LOGE(TAG, "Create attr table failed, status=%d", param->add_attr_tab.status);
+        }
+        break;
+
+    case ESP_GATTS_START_EVT:
+        if (param->start.status == ESP_GATT_OK) {
+            ESP_LOGI(TAG, "GATT service started");
+            /* Start advertising */
+            ble_gatt_dsp_start_advertising();
+        }
+        break;
+
+    case ESP_GATTS_CONNECT_EVT:
+        ESP_LOGI(TAG, "BLE client connected, conn_id=%d", param->connect.conn_id);
+        s_ble.conn_id = param->connect.conn_id;
+        s_ble.connected = true;
+
+        /* Update connection parameters for better latency (FR-14) */
+        esp_ble_conn_update_params_t conn_params = {
+            .latency = 0,
+            .max_int = 0x20,    /* 40ms */
+            .min_int = 0x10,    /* 20ms */
+            .timeout = 400,     /* 4s */
+        };
+        memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+        esp_ble_gap_update_conn_params(&conn_params);
+
+        /* Send initial status notification */
+        update_status_value();
+        break;
+
+    case ESP_GATTS_DISCONNECT_EVT:
+        ESP_LOGI(TAG, "BLE client disconnected, reason=0x%x", param->disconnect.reason);
+        s_ble.conn_id = 0xFFFF;
+        s_ble.connected = false;
+        s_ble.notifications_enabled = false;
+
+        /* Restart advertising (FR-15: BLE disconnect must not affect audio) */
+        ble_gatt_dsp_start_advertising();
+        break;
+
+    case ESP_GATTS_WRITE_EVT:
+        if (!param->write.is_prep) {
+            /* Handle write to control characteristic */
+            if (param->write.handle == s_ble.handle_table[IDX_CTRL_VAL]) {
+                handle_control_write(param->write.value, param->write.len);
+
+                /* Send response if needed */
+                if (param->write.need_rsp) {
+                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
+                                               param->write.trans_id, ESP_GATT_OK, NULL);
+                }
+            }
+            /* Handle write to status CCC (enable/disable notifications) */
+            else if (param->write.handle == s_ble.handle_table[IDX_STATUS_CCC]) {
+                if (param->write.len == 2) {
+                    uint16_t ccc_val = param->write.value[0] | (param->write.value[1] << 8);
+                    s_ble.notifications_enabled = (ccc_val == 0x0001);
+                    ESP_LOGI(TAG, "Notifications %s",
+                             s_ble.notifications_enabled ? "enabled" : "disabled");
+                }
+            }
+        }
+        break;
+
+    case ESP_GATTS_READ_EVT:
+        /* Auto-response handles reads, but log for debugging */
+        ESP_LOGD(TAG, "Read request, handle=%d", param->read.handle);
+        break;
+
+    case ESP_GATTS_MTU_EVT:
+        ESP_LOGI(TAG, "MTU updated to %d", param->mtu.mtu);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/*
+ * Public API Implementation
+ */
+
+esp_err_t ble_gatt_dsp_init(ble_dsp_settings_cb_t settings_changed_cb)
+{
+    ESP_LOGI(TAG, "Initializing BLE GATT DSP service");
+
+    s_ble.settings_cb = settings_changed_cb;
+
+    /* Register GAP callback */
+    esp_err_t ret = esp_ble_gap_register_callback(gap_event_handler);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "GAP callback register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Register GATTS callback */
+    ret = esp_ble_gatts_register_callback(gatts_event_handler);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "GATTS callback register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Register GATT application */
+    ret = esp_ble_gatts_app_register(DSP_PROFILE_APP_ID);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "GATTS app register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Note: MTU is negotiated during connection, default is 23 bytes
+     * For larger payloads, client can request MTU exchange */
+
+    ESP_LOGI(TAG, "BLE GATT DSP service initialized");
+    return ESP_OK;
+}
+
+esp_err_t ble_gatt_dsp_start_advertising(void)
+{
+    esp_err_t ret = esp_ble_gap_start_advertising(&adv_params);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Start advertising failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+esp_err_t ble_gatt_dsp_stop_advertising(void)
+{
+    esp_err_t ret = esp_ble_gap_stop_advertising();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Stop advertising failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+esp_err_t ble_gatt_dsp_notify_status(void)
+{
+    if (!s_ble.connected || !s_ble.notifications_enabled) {
+        return ESP_OK;  /* Not an error, just nothing to do */
+    }
+
+    /* Update status value from DSP state */
+    update_status_value();
+
+    /* Send notification */
+    esp_err_t ret = esp_ble_gatts_send_indicate(s_ble.gatts_if, s_ble.conn_id,
+                                                 s_ble.handle_table[IDX_STATUS_VAL],
+                                                 sizeof(status_value), status_value, false);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Send notification failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGD(TAG, "Status notification sent");
+    }
+
+    return ret;
+}
+
+bool ble_gatt_dsp_is_connected(void)
+{
+    return s_ble.connected;
+}
+
+uint16_t ble_gatt_dsp_get_conn_handle(void)
+{
+    return s_ble.conn_id;
+}
