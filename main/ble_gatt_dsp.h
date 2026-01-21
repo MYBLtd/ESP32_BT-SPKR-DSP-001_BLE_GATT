@@ -52,6 +52,12 @@ extern "C" {
     0x78, 0x56, 0x34, 0x12, 0x03, 0x00, 0x00, 0x00 \
 }
 
+/* GalacticStatus Characteristic UUID: 00000004-1234-5678-9ABC-DEF012345678 */
+#define DSP_GALACTIC_CHAR_UUID_128 { \
+    0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, \
+    0x78, 0x56, 0x34, 0x12, 0x04, 0x00, 0x00, 0x00 \
+}
+
 /*
  * Control Protocol (Section 10.3)
  * Format: [CMD (1 byte)] [VAL (1 byte)]
@@ -66,6 +72,20 @@ extern "C" {
  */
 #define DSP_STATUS_PROTOCOL_VERSION 0x01
 #define DSP_STATUS_SIZE             4
+
+/*
+ * GalacticStatus Payload (FR-18)
+ * Format: [VER][PRESET][FLAGS][ENERGY][VOLUME][BATTERY][LAST_CONTACT]
+ * Byte 0: Protocol version (0x42)
+ * Byte 1: currentQuantumFlavor (preset 0-3)
+ * Byte 2: shieldStatus (flags: mute, panic, loudness, limiter)
+ * Byte 3: energyCoreLevel (0-100, placeholder)
+ * Byte 4: distortionFieldStrength (volume 0-100, placeholder)
+ * Byte 5: Energy core (battery 0-100, placeholder)
+ * Byte 6: lastContact (seconds since last BLE interaction, 0-255)
+ */
+#define DSP_GALACTIC_PROTOCOL_VERSION  0x42
+#define DSP_GALACTIC_STATUS_SIZE       7
 
 /*
  * BLE advertising configuration
@@ -110,6 +130,14 @@ esp_err_t ble_gatt_dsp_stop_advertising(void);
  * @return ESP_OK on success
  */
 esp_err_t ble_gatt_dsp_notify_status(void);
+
+/*
+ * Send GalacticStatus notification to connected client (FR-18, FR-20)
+ * Contains 7-byte payload with extended status information
+ *
+ * @return ESP_OK on success
+ */
+esp_err_t ble_gatt_dsp_notify_galactic_status(void);
 
 /*
  * Check if a BLE client is connected

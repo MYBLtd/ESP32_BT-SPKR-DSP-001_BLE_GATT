@@ -4,8 +4,8 @@
 
 ## Version
 **Document ID:** FSD-DSP-001
-**Status:** Draft (v0.9)
-**Date:** 2026-01-20
+**Status:** Draft (v1.0)
+**Date:** 2026-01-21
 **GIT Origin:** https://github.com/MYBLtd/ESP32_BT-SPKR-DSP-001_BLE_GATT.git
 
 ## Author
@@ -140,7 +140,37 @@ CPU budget: DSP chain within real-time budget on ESP32 (no large FFTs in v1).
 **FR-17**
 Memory: no dynamic allocations in the audio callback.
 
+**FR-18**
+GalacticStatus characteristic:
 
+- Characteristic: GalacticStatus
+- UUID: `00000004-1234-5678-9ABC-DEF012345678`
+- Properties: READ, NOTIFY
+- Length: 7 bytes
+
+| Byte | Field                   | Value   | Description                              |
+| ---- | ----------------------- | ------- | ---------------------------------------- |
+| 0    | protocolVersion         | 0x42    | Protocol version (always 0x42)           |
+| 1    | currentQuantumFlavor    | 0-3     | Current preset ID                        |
+| 2    | shieldStatus            | bitfield| Flags: mute, panic, loudness, limiter    |
+| 3    | energyCoreLevel         | 0-100   | Reserved (placeholder)                   |
+| 4    | distortionFieldStrength | 0-100   | Volume level (placeholder)               |
+| 5    | energyCore              | 0-100   | Battery level (placeholder)              |
+| 6    | lastContact             | 0-255   | Seconds since last BLE interaction       |
+
+**FR-19**
+Last contact tracking:
+
+- The system tracks the timestamp of the last BLE interaction (read or write).
+- The `lastContact` field in GalacticStatus reports seconds since last interaction.
+- Value is clamped to 255 (max uint8_t) for interactions older than 255 seconds.
+
+**FR-20**
+Periodic status notifications:
+
+- GalacticStatus notifications are pushed automatically 2 times per second (every 500ms).
+- Notifications are sent only when a client is connected and has enabled notifications via CCCD.
+- Timer is started on BLE connect and stopped on disconnect.
 
 ## 4 DSP architecture
 
@@ -247,16 +277,17 @@ A generic BLE app must be able to write presets/loudness and read status.
 
 ### 10.2 Services & Characteristics
 
-Service UUID: **DSP_CONTROL** (custom 128-bit UUID, assigned by the project)
+**Service UUID:** `00000001-1234-5678-9ABC-DEF012345678`
 
-Characteristics:
+The service UUID is included in BLE advertising packets for service discovery.
 
-- **CONTROL_WRITE**  
-  - Properties: Write, Write Without Response  
-  - Payload: binary (compact)
-- **STATUS_NOTIFY**  
-  - Properties: Read, Notify  
-  - Payload: binary status snapshot
+**Characteristics:**
+
+| Characteristic   | UUID                                     | Properties              | Size    |
+| ---------------- | ---------------------------------------- | ----------------------- | ------- |
+| CONTROL_WRITE    | `00000002-1234-5678-9ABC-DEF012345678`   | Write, Write No Response| 2 bytes |
+| STATUS_NOTIFY    | `00000003-1234-5678-9ABC-DEF012345678`   | Read, Notify            | 4 bytes |
+| GALACTIC_STATUS  | `00000004-1234-5678-9ABC-DEF012345678`   | Read, Notify            | 7 bytes |
 
 ### 10.3 Control protocol (v1 – 2-byte commands)
 
@@ -277,20 +308,72 @@ Behavior:
 
 Format: **[VER][PRESET][LOUDNESS][FLAGS]**
 
-- VER: protocol version (starts at **0x01**)  
-- PRESET: **0..3**  
-- LOUDNESS: **0/1**  
-- FLAGS: bitfield (v1):  
-  - bit0 limiter active (always 1)  
-  - bit1 clipping detected (optional)  
-  - bit2 thermal warning (optional)  
-  - other bits reserved=0
+| Byte | Field    | Value  | Description                        |
+| ---- | -------- | ------ | ---------------------------------- |
+| 0    | VER      | 0x01   | Protocol version                   |
+| 1    | PRESET   | 0-3    | Current preset ID                  |
+| 2    | LOUDNESS | 0/1    | Loudness off/on                    |
+| 3    | FLAGS    | bitfield| Status flags                      |
+
+FLAGS bitfield:
+- bit0: limiter active (always 1)
+- bit1: clipping detected (optional)
+- bit2: thermal warning (optional)
+- bit3-7: reserved (0)
+
+### 10.5 GalacticStatus payload (v1 – 7 bytes)
+
+Format: **[VER][PRESET][FLAGS][ENERGY][VOLUME][BATTERY][LAST_CONTACT]**
+
+| Byte | Field         | Value   | Description                        |
+| ---- | ------------- | ------- | ---------------------------------- |
+| 0    | VER           | 0x42    | Protocol version (always 0x42)     |
+| 1    | PRESET        | 0-3     | Current preset (QuantumFlavor)     |
+| 2    | FLAGS         | bitfield| Shield status flags                |
+| 3    | ENERGY        | 0-100   | Energy core level (reserved)       |
+| 4    | VOLUME        | 0-100   | Distortion field strength (reserved)|
+| 5    | BATTERY       | 0-100   | Energy core/battery (reserved)     |
+| 6    | LAST_CONTACT  | 0-255   | Seconds since last BLE interaction |
+
+This characteristic is automatically notified every 500ms (FR-20) when notifications are enabled.
+
+### 10.6 BLE advertising configuration
+
+| Parameter        | Value            | Description                         |
+| ---------------- | ---------------- | ----------------------------------- |
+| Device Name      | "ESP32 Speaker"  | Advertised BLE device name          |
+| Adv Interval Min | 20ms (0x20)      | Minimum advertising interval        |
+| Adv Interval Max | 40ms (0x40)      | Maximum advertising interval        |
+| Appearance       | 0x0841           | BLE Speaker appearance              |
+| Service UUID     | Included         | Service UUID in advertising packet  |
+
+The advertising packet contains the service UUID for filtering/discovery. The scan response contains the device name and TX power.
+
+### 10.7 Connection parameters
+
+On connection, the following parameters are requested to optimize latency (FR-14):
+
+| Parameter        | Value      | Description                         |
+| ---------------- | ---------- | ----------------------------------- |
+| Min Interval     | 20ms       | Minimum connection interval         |
+| Max Interval     | 40ms       | Maximum connection interval         |
+| Latency          | 0          | Slave latency (no skipped events)   |
+| Timeout          | 4000ms     | Supervision timeout                 |
 
 ## 11. State machine and error handling
 
 ### 11.1 BLE connect/disconnect
 
-- On BLE disconnect: audio continues playing; settings remain active.
+- On BLE connect:
+  - Connection parameters are updated for low latency (FR-14)
+  - Last contact timestamp is initialized
+  - GalacticStatus notification timer is started (FR-20)
+  - Status values are updated and ready for read
+- On BLE disconnect:
+  - Audio continues playing; settings remain active (FR-15)
+  - Notifications are disabled
+  - GalacticStatus notification timer is stopped
+  - Advertising is automatically restarted
 - On reboot: settings are loaded from NVS; status notify on first connect (read/notify).
 
 ### 11.2 Unknown command / value

@@ -14,6 +14,8 @@
 #include "esp_gatts_api.h"
 #include "esp_bt_defs.h"
 #include "esp_bt_main.h"
+#include "esp_timer.h"
+#include "freertos/timers.h"
 
 static const char *TAG = "BLE_GATT";
 
@@ -29,8 +31,14 @@ enum {
     IDX_STATUS_CHAR,            /* Status characteristic declaration */
     IDX_STATUS_VAL,             /* Status characteristic value */
     IDX_STATUS_CCC,             /* Status Client Characteristic Configuration */
+    IDX_GALACTIC_CHAR,          /* GalacticStatus characteristic declaration */
+    IDX_GALACTIC_VAL,           /* GalacticStatus characteristic value */
+    IDX_GALACTIC_CCC,           /* GalacticStatus Client Characteristic Configuration */
     IDX_NB,                     /* Number of attributes */
 };
+
+/* GalacticStatus notification interval (FR-20: 2x per second) */
+#define GALACTIC_NOTIFY_INTERVAL_MS  500
 
 /* Service UUID */
 static const uint8_t dsp_service_uuid[16] = DSP_SERVICE_UUID_128;
@@ -38,13 +46,16 @@ static const uint8_t dsp_service_uuid[16] = DSP_SERVICE_UUID_128;
 /* Characteristic UUIDs */
 static const uint8_t dsp_control_uuid[16] = DSP_CONTROL_CHAR_UUID_128;
 static const uint8_t dsp_status_uuid[16] = DSP_STATUS_CHAR_UUID_128;
+static const uint8_t dsp_galactic_uuid[16] = DSP_GALACTIC_CHAR_UUID_128;
 
 /* Characteristic properties */
 static const uint8_t ctrl_char_prop = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR;
 static const uint8_t status_char_prop = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+static const uint8_t galactic_char_prop = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
 
-/* Client Characteristic Configuration Descriptor default value */
+/* Client Characteristic Configuration Descriptor default values */
 static uint8_t status_ccc[2] = {0x00, 0x00};
+static uint8_t galactic_ccc[2] = {0x00, 0x00};
 
 /* Control characteristic value (2 bytes: CMD + VAL) */
 static uint8_t ctrl_value[2] = {0x00, 0x00};
@@ -55,6 +66,17 @@ static uint8_t status_value[DSP_STATUS_SIZE] = {
     0x00,                           /* PRESET */
     0x00,                           /* LOUDNESS */
     0x01                            /* FLAGS (limiter active) */
+};
+
+/* GalacticStatus characteristic value (7 bytes per FR-18) */
+static uint8_t galactic_value[DSP_GALACTIC_STATUS_SIZE] = {
+    DSP_GALACTIC_PROTOCOL_VERSION,  /* VER: 0x42 */
+    0x00,                           /* currentQuantumFlavor (preset) */
+    0x01,                           /* shieldStatus (flags) */
+    100,                            /* energyCoreLevel (placeholder) */
+    50,                             /* distortionFieldStrength (volume placeholder) */
+    100,                            /* Energy core (battery placeholder) */
+    0                               /* lastContact (seconds) */
 };
 
 /* GATT attribute table */
@@ -118,6 +140,36 @@ static const esp_gatts_attr_db_t gatt_db[IDX_NB] = {
             sizeof(status_ccc), sizeof(status_ccc), status_ccc
         }
     },
+
+    /* GalacticStatus Characteristic Declaration (FR-18) */
+    [IDX_GALACTIC_CHAR] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_CHAR_DECLARE},
+            ESP_GATT_PERM_READ,
+            sizeof(uint8_t), sizeof(uint8_t), (uint8_t *)&galactic_char_prop
+        }
+    },
+
+    /* GalacticStatus Characteristic Value */
+    [IDX_GALACTIC_VAL] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_128, (uint8_t *)dsp_galactic_uuid,
+            ESP_GATT_PERM_READ,
+            sizeof(galactic_value), sizeof(galactic_value), galactic_value
+        }
+    },
+
+    /* GalacticStatus Client Characteristic Configuration Descriptor */
+    [IDX_GALACTIC_CCC] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_CHAR_CLIENT_CONFIG},
+            ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+            sizeof(galactic_ccc), sizeof(galactic_ccc), galactic_ccc
+        }
+    },
 };
 
 /* Advertising data - contains service UUID and flags
@@ -172,6 +224,9 @@ typedef struct {
     uint16_t handle_table[IDX_NB];
     bool connected;
     bool notifications_enabled;
+    bool galactic_notifications_enabled;  /* CCCD for GalacticStatus (FR-18) */
+    int64_t last_contact_us;              /* Timestamp of last BLE interaction (FR-19) */
+    TimerHandle_t galactic_notify_timer;  /* FreeRTOS timer for periodic notifications (FR-20) */
     ble_dsp_settings_cb_t settings_cb;
 } ble_state_t;
 
@@ -180,6 +235,9 @@ static ble_state_t s_ble = {
     .conn_id = 0xFFFF,
     .connected = false,
     .notifications_enabled = false,
+    .galactic_notifications_enabled = false,
+    .last_contact_us = 0,
+    .galactic_notify_timer = NULL,
     .settings_cb = NULL,
 };
 
@@ -189,6 +247,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                                 esp_ble_gatts_cb_param_t *param);
 static void handle_control_write(const uint8_t *data, uint16_t len);
 static void update_status_value(void);
+static void update_galactic_status_value(void);
+static void galactic_notify_timer_callback(TimerHandle_t timer);
 
 /*
  * GAP event handler
@@ -304,6 +364,50 @@ static void update_status_value(void)
 }
 
 /*
+ * Update GalacticStatus characteristic value (FR-18, FR-19)
+ * Includes last contact time calculation
+ */
+static void update_galactic_status_value(void)
+{
+    dsp_status_t dsp_status;
+    dsp_get_status(&dsp_status);
+
+    /* Calculate last contact age in seconds (FR-19) */
+    int64_t now_us = esp_timer_get_time();
+    uint32_t age_sec = (now_us - s_ble.last_contact_us) / 1000000;
+    if (age_sec > 255) {
+        age_sec = 255;  /* Clamp to 8-bit max */
+    }
+
+    galactic_value[0] = DSP_GALACTIC_PROTOCOL_VERSION;  /* Protocol version: 0x42 */
+    galactic_value[1] = dsp_status.preset;              /* currentQuantumFlavor */
+    galactic_value[2] = dsp_status.flags;               /* shieldStatus */
+    galactic_value[3] = 100;                            /* energyCoreLevel (placeholder) */
+    galactic_value[4] = 50;                             /* distortionFieldStrength (placeholder) */
+    galactic_value[5] = 100;                            /* Energy core/battery (placeholder) */
+    galactic_value[6] = (uint8_t)age_sec;               /* lastContact */
+
+    /* Update the attribute value in GATT database */
+    if (s_ble.gatts_if != ESP_GATT_IF_NONE && s_ble.handle_table[IDX_GALACTIC_VAL] != 0) {
+        esp_ble_gatts_set_attr_value(s_ble.handle_table[IDX_GALACTIC_VAL],
+                                     sizeof(galactic_value), galactic_value);
+    }
+}
+
+/*
+ * Timer callback for periodic GalacticStatus notifications (FR-20)
+ * Called 2x per second (every 500ms)
+ */
+static void galactic_notify_timer_callback(TimerHandle_t timer)
+{
+    (void)timer;  /* Unused parameter */
+
+    if (s_ble.connected && s_ble.galactic_notifications_enabled) {
+        ble_gatt_dsp_notify_galactic_status();
+    }
+}
+
+/*
  * GATTS event handler
  */
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
@@ -360,6 +464,9 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         s_ble.conn_id = param->connect.conn_id;
         s_ble.connected = true;
 
+        /* Reset last contact timestamp (FR-19) */
+        s_ble.last_contact_us = esp_timer_get_time();
+
         /* Update connection parameters for better latency (FR-14) */
         esp_ble_conn_update_params_t conn_params = {
             .latency = 0,
@@ -372,6 +479,11 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
         /* Send initial status notification */
         update_status_value();
+
+        /* Start GalacticStatus notification timer (FR-20) */
+        if (s_ble.galactic_notify_timer != NULL) {
+            xTimerStart(s_ble.galactic_notify_timer, 0);
+        }
         break;
 
     case ESP_GATTS_DISCONNECT_EVT:
@@ -379,12 +491,21 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         s_ble.conn_id = 0xFFFF;
         s_ble.connected = false;
         s_ble.notifications_enabled = false;
+        s_ble.galactic_notifications_enabled = false;
+
+        /* Stop GalacticStatus notification timer (FR-20) */
+        if (s_ble.galactic_notify_timer != NULL) {
+            xTimerStop(s_ble.galactic_notify_timer, 0);
+        }
 
         /* Restart advertising (FR-15: BLE disconnect must not affect audio) */
         ble_gatt_dsp_start_advertising();
         break;
 
     case ESP_GATTS_WRITE_EVT:
+        /* Update last contact timestamp on any write (FR-19) */
+        s_ble.last_contact_us = esp_timer_get_time();
+
         if (!param->write.is_prep) {
             /* Handle write to control characteristic */
             if (param->write.handle == s_ble.handle_table[IDX_CTRL_VAL]) {
@@ -401,14 +522,25 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                 if (param->write.len == 2) {
                     uint16_t ccc_val = param->write.value[0] | (param->write.value[1] << 8);
                     s_ble.notifications_enabled = (ccc_val == 0x0001);
-                    ESP_LOGI(TAG, "Notifications %s",
+                    ESP_LOGI(TAG, "Status notifications %s",
                              s_ble.notifications_enabled ? "enabled" : "disabled");
+                }
+            }
+            /* Handle write to GalacticStatus CCC (enable/disable notifications) */
+            else if (param->write.handle == s_ble.handle_table[IDX_GALACTIC_CCC]) {
+                if (param->write.len == 2) {
+                    uint16_t ccc_val = param->write.value[0] | (param->write.value[1] << 8);
+                    s_ble.galactic_notifications_enabled = (ccc_val == 0x0001);
+                    ESP_LOGI(TAG, "GalacticStatus notifications %s",
+                             s_ble.galactic_notifications_enabled ? "enabled" : "disabled");
                 }
             }
         }
         break;
 
     case ESP_GATTS_READ_EVT:
+        /* Update last contact timestamp on any read (FR-19) */
+        s_ble.last_contact_us = esp_timer_get_time();
         /* Auto-response handles reads, but log for debugging */
         ESP_LOGD(TAG, "Read request, handle=%d", param->read.handle);
         break;
@@ -431,6 +563,19 @@ esp_err_t ble_gatt_dsp_init(ble_dsp_settings_cb_t settings_changed_cb)
     ESP_LOGI(TAG, "Initializing BLE GATT DSP service");
 
     s_ble.settings_cb = settings_changed_cb;
+
+    /* Create GalacticStatus notification timer (FR-20: 2x per second) */
+    s_ble.galactic_notify_timer = xTimerCreate(
+        "galactic_notify",
+        pdMS_TO_TICKS(GALACTIC_NOTIFY_INTERVAL_MS),
+        pdTRUE,     /* Auto-reload */
+        NULL,       /* Timer ID */
+        galactic_notify_timer_callback
+    );
+    if (s_ble.galactic_notify_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create GalacticStatus notification timer");
+        return ESP_ERR_NO_MEM;
+    }
 
     /* Register GAP callback */
     esp_err_t ret = esp_ble_gap_register_callback(gap_event_handler);
@@ -495,6 +640,28 @@ esp_err_t ble_gatt_dsp_notify_status(void)
         ESP_LOGW(TAG, "Send notification failed: %s", esp_err_to_name(ret));
     } else {
         ESP_LOGD(TAG, "Status notification sent");
+    }
+
+    return ret;
+}
+
+esp_err_t ble_gatt_dsp_notify_galactic_status(void)
+{
+    if (!s_ble.connected || !s_ble.galactic_notifications_enabled) {
+        return ESP_OK;  /* Not an error, just nothing to do */
+    }
+
+    /* Update GalacticStatus value including last contact time */
+    update_galactic_status_value();
+
+    /* Send notification */
+    esp_err_t ret = esp_ble_gatts_send_indicate(s_ble.gatts_if, s_ble.conn_id,
+                                                 s_ble.handle_table[IDX_GALACTIC_VAL],
+                                                 sizeof(galactic_value), galactic_value, false);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "GalacticStatus notification failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGD(TAG, "GalacticStatus notification sent");
     }
 
     return ret;
