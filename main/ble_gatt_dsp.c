@@ -120,29 +120,32 @@ static const esp_gatts_attr_db_t gatt_db[IDX_NB] = {
     },
 };
 
-/* Advertising data */
+/* Advertising data - contains service UUID and flags
+ * Flags: General Discoverable + BR/EDR Not Supported
+ * Max 31 bytes: flags(3) + UUID(18) = 21 bytes */
 static esp_ble_adv_data_t adv_data = {
     .set_scan_rsp = false,
-    .include_name = true,
+    .include_name = false,              /* Name in scan response to save space */
     .include_txpower = false,
-    .min_interval = 0x0006,     /* 7.5ms */
-    .max_interval = 0x0010,     /* 20ms */
-    .appearance = 0x0841,       /* Speaker appearance */
+    .min_interval = 0x0006,             /* 7.5ms */
+    .max_interval = 0x0010,             /* 20ms */
+    .appearance = 0x0841,               /* Speaker appearance */
     .manufacturer_len = 0,
     .p_manufacturer_data = NULL,
     .service_data_len = 0,
     .p_service_data = NULL,
-    .service_uuid_len = 0,
-    .p_service_uuid = NULL,
+    .service_uuid_len = sizeof(dsp_service_uuid),
+    .p_service_uuid = (uint8_t *)dsp_service_uuid,
     .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
 };
 
-/* Scan response data */
+/* Scan response data - contains device name and service UUID
+ * Max 31 bytes: name(15) + UUID(18) > 31, so UUID already in adv */
 static esp_ble_adv_data_t scan_rsp_data = {
     .set_scan_rsp = true,
-    .include_name = true,
+    .include_name = true,               /* Device name here */
     .include_txpower = true,
-    .appearance = 0x0841,
+    .appearance = 0x0841,               /* Speaker appearance */
     .manufacturer_len = 0,
     .p_manufacturer_data = NULL,
     .service_data_len = 0,
