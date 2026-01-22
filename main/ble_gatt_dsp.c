@@ -328,6 +328,24 @@ static void handle_control_write(const uint8_t *data, uint16_t len)
         ESP_LOGI(TAG, "Status request received");
         break;
 
+    case DSP_CMD_SET_MUTE:
+        dsp_set_mute(val != 0);
+        settings_changed = true;
+        ESP_LOGI(TAG, "Mute set to: %s", val ? "ON" : "OFF");
+        break;
+
+    case DSP_CMD_SET_AUDIO_DUCK:
+        dsp_set_audio_duck(val != 0);
+        settings_changed = true;
+        ESP_LOGI(TAG, "Audio Duck set to: %s", val ? "ON" : "OFF");
+        break;
+
+    case DSP_CMD_SET_NORMALIZER:
+        dsp_set_normalizer(val != 0);
+        settings_changed = true;
+        ESP_LOGI(TAG, "Normalizer set to: %s", val ? "ON" : "OFF");
+        break;
+
     default:
         ESP_LOGW(TAG, "Unknown command: 0x%02X", cmd);
         break;
@@ -379,9 +397,29 @@ static void update_galactic_status_value(void)
         age_sec = 255;  /* Clamp to 8-bit max */
     }
 
+    /* Build shieldStatus byte per Protocol.md:
+     * Bit 0 (0x01): Muted
+     * Bit 1 (0x02): Audio Duck (panic mode)
+     * Bit 2 (0x04): Loudness
+     * Bit 3 (0x08): Normalizer (DRC active)
+     */
+    uint8_t shield_status = 0;
+    if (dsp_get_mute()) {
+        shield_status |= 0x01;  /* Bit 0: Mute */
+    }
+    if (dsp_get_audio_duck()) {
+        shield_status |= 0x02;  /* Bit 1: Audio Duck */
+    }
+    if (dsp_status.loudness) {
+        shield_status |= 0x04;  /* Bit 2: Loudness */
+    }
+    if (dsp_get_normalizer()) {
+        shield_status |= 0x08;  /* Bit 3: Normalizer */
+    }
+
     galactic_value[0] = DSP_GALACTIC_PROTOCOL_VERSION;  /* Protocol version: 0x42 */
     galactic_value[1] = dsp_status.preset;              /* currentQuantumFlavor */
-    galactic_value[2] = dsp_status.flags;               /* shieldStatus */
+    galactic_value[2] = shield_status;                  /* shieldStatus */
     galactic_value[3] = 100;                            /* energyCoreLevel (placeholder) */
     galactic_value[4] = 50;                             /* distortionFieldStrength (placeholder) */
     galactic_value[5] = 100;                            /* Energy core/battery (placeholder) */
@@ -639,6 +677,8 @@ esp_err_t ble_gatt_dsp_notify_status(void)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Send notification failed: %s", esp_err_to_name(ret));
     } else {
+        /* Reset last contact on successful notification */
+        s_ble.last_contact_us = esp_timer_get_time();
         ESP_LOGD(TAG, "Status notification sent");
     }
 
@@ -661,6 +701,8 @@ esp_err_t ble_gatt_dsp_notify_galactic_status(void)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "GalacticStatus notification failed: %s", esp_err_to_name(ret));
     } else {
+        /* Reset last contact on successful notification */
+        s_ble.last_contact_us = esp_timer_get_time();
         ESP_LOGD(TAG, "GalacticStatus notification sent");
     }
 

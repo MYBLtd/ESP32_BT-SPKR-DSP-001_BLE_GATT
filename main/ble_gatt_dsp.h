@@ -65,6 +65,9 @@ extern "C" {
 #define DSP_CMD_SET_PRESET      0x01    /* VAL: 0-3 (preset ID) */
 #define DSP_CMD_SET_LOUDNESS    0x02    /* VAL: 0/1 (off/on) */
 #define DSP_CMD_GET_STATUS      0x03    /* VAL: 0 (triggers notify) */
+#define DSP_CMD_SET_MUTE        0x04    /* VAL: 0/1 (unmute/mute) */
+#define DSP_CMD_SET_AUDIO_DUCK  0x05    /* VAL: 0/1 (off/on) - FR-21: reduces volume to ~25% */
+#define DSP_CMD_SET_NORMALIZER  0x06    /* VAL: 0/1 (off/on) - FR-22: dynamic range compression */
 
 /*
  * Status Payload (Section 10.4)

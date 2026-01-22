@@ -4,59 +4,70 @@
 
 ## Version
 **Document ID:** FSD-DSP-001
-**Status:** Draft (v1.0)
-**Date:** 2026-01-21
+**Status:** Release (v1.1)
+**Date:** 2026-01-22
 **GIT Origin:** https://github.com/MYBLtd/ESP32_BT-SPKR-DSP-001_BLE_GATT.git
 
 ## Author
 
 Robin Kluit
 
+## Revision History
+
+| Version | Date       | Description                                      |
+|---------|------------|--------------------------------------------------|
+| v1.0    | 2026-01-21 | Initial release with presets and loudness        |
+| v1.1    | 2026-01-22 | Added Mute, Audio Duck, Normalizer; fixed lastContact |
+
 ## 1. Purpose and Scope
 
-This document specifies the functional requierment, behaviou, interfaces and constraints of a Bluetooth audio receiver processing an audio stream and driving a loudspeaker.
+This document specifies the functional requirements, behaviour, interfaces and constraints of a Bluetooth audio receiver processing an audio stream and driving a loudspeaker.
 
 The FSD is intended to:
 
 - Define **what the system shall do**, not how it is implemented internally
 - Serve as a reference for development, testing and future extensions
-- Be understandable by engineers, educators and tecnically inclined users
+- Be understandable by engineers, educators and technically inclined users
 
 ## 2. System Overview
 
 ### 2.1 System Description
 The system offers a headless user interface (no buttons/GUI on the speaker) that allows users to use their phone to:
 
-Select presets (e.g., Office, Full, Night, Speech).
+- Select presets (e.g., Office, Full, Night, Speech)
+- Toggle loudness (on/off)
+- Mute/unmute audio
+- Enable Audio Duck (panic button for quick volume reduction)
+- Enable Normalizer (dynamic range compression)
 
-Toggle loudness (on/off, optional with strength).
+Audio is streamed via Bluetooth Classic A2DP. Control is via BLE GATT. A dedicated companion app is not required: control is possible with generic BLE apps (nRF Connect/LightBlue) or the 42 Decibels iOS app.
 
-Optionally adjust bass boost and treble in discrete steps.
-
-Audio is streamed via Bluetooth Classic A2DP. Control is via BLE GATT. A dedicated companion app is not required for v1: control should be possible with generic BLE apps (nRF Connect/LightBlue).
-
-### 2.2 Scope (v1)
+### 2.2 Scope (v1.1)
 
 **In scope:**
-- DSP preset engine: vaste EQ-curves per preset
-- Loudness overlay (aan/uit)
-- Beschermingsketen: high-pass + limiter
+- DSP preset engine: fixed EQ-curves per preset
+- Loudness overlay (on/off)
+- Mute function with smooth fade
+- Audio Duck (panic button) with ~25% volume reduction
+- Normalizer (dynamic range compression)
+- Protection chain: high-pass + limiter
 - BLE GATT control plane (write + status notify)
-- Persistente opslag van settings
-- Volume-dependent loudness based on 'speaker volume'
-- OTA updates
+- Persistent storage of settings
+- GalacticStatus extended status reporting
 
 **Out of scope**
-- Room calibration / microfoon-measuring
+- Room calibration / microphone-measuring
 - Wi-Fi SoftAP UI
+- OTA updates (planned for v1.2)
 
 ### 2.3 Design-principles
 
-A2DP audio in -> decode -> DSP (EQ/presets/loudness/limiter) -> I2S out -> amplifier/driver. 
+A2DP audio in -> decode -> DSP (EQ/presets/loudness/normalizer/limiter) -> I2S out -> amplifier/driver.
+
 BLE Controls send discrete settings to DSP without interrupting audio.
 Robust: no audio stuttering due to control traffic.
 
-Simple UX: buttons/presets and toggles, no ‘pro audio’ terms needed.
+Simple UX: buttons/presets and toggles, no 'pro audio' terms needed.
 
 Driver protection first: bass boost should never cause driver/amp clipping or over-excitation.
 
@@ -65,78 +76,76 @@ Driver protection first: bass boost should never cause driver/amp clipping or ov
 Since the exact driver/enclosure may still be unknown, this document uses practical defaults that can be easily tuned later.
 
 Assumptions (default):
-- Driver: small full range (± 40-70 mm)
+- Driver: small full range (40-70 mm)
 - Enclosure: suboptimal/small volume -> limited real low end
 - Sample rate: 44.1 kHz or 48 kHz (DSP must support both)
-- Mono or stereo: DSP must support mono; stereo optional
+- Mono or stereo: DSP must support stereo
 
 ## 3 Functional Requirements
 
 ### 3.1 Bluetooth functionality
 
 **FR-1**
-The system shall publish it's system name on bluetooth to allow devices to connect to it.
+The system shall publish its system name on Bluetooth to allow devices to connect to it.
 
 **FR-2**
-The system understands IoS bluetooth security and is able to let a IoS device connect to it.
+The system understands iOS Bluetooth security and is able to let an iOS device connect to it.
 
 **FR-3**
-The system receives an audio stream from the connecte device
+The system receives an audio stream from the connected device.
 
 **FR-4**
-The system porcesses the received audio stream and outputs it using I2S.
+The system processes the received audio stream and outputs it using I2S.
 
 **FR-5**
-The system processes the received audio stream and outputs it using I2S.
+The system supports both 44.1 kHz and 48 kHz sample rates.
 
 **FR-6**
 The system uses a robust mechanism to recover itself from crashes or other malfunctioning.
 
-### 3.2  DSP functionality
+### 3.2 DSP functionality
 
 **FR-7**
 Global DSP headroom (requirement):
 Pre-gain: -6 dB (default) to cleanly accommodate EQ boosts + loudness + limiter.
 
 **FR-8**
-The system implements at least 3 presets:
-	•	OFFICE (office/background)
-	•	FULL (full/rich)
-	•	NIGHT (low volume / evening)
-	•	SPEECH (podcast/speech)
+The system implements 4 presets:
+- OFFICE (office/background)
+- FULL (full/rich)
+- NIGHT (low volume / evening)
+- SPEECH (podcast/speech)
 
 **FR-9**
-User can Toggle loudness: with a toggle, make low-volume playback fuller and clearer.
-	•	Loudness is on/off.
-	•	Loudness overlay is mild and designed for low volume.
-	•	Loudness overlay must not make limiter behavior extremely “pumpy”.
+User can toggle loudness: with a toggle, make low-volume playback fuller and clearer.
+- Loudness is on/off
+- Loudness overlay is mild and designed for low volume
+- Loudness overlay must not make limiter behavior extremely "pumpy"
 
-Optional (v1.1): Loudness strength 0..2 (mild/normal/strong).
-
-**FR-10** Bass/Treble discrete steps (optional v1.1)
-	•	Bass boost level: 0..3
-	•	Treble level: 0..2
+**FR-10** Bass/Treble discrete steps (optional v1.2)
+- Bass boost level: 0..3
+- Treble level: 0..2
 
 **FR-11**
-Safety: the speaker must not distort or “bottom out” due to overly aggressive bass.
+Safety: the speaker must not distort or "bottom out" due to overly aggressive bass.
 
-**FR12** Persistent storage
+**FR-12** Persistent storage
 - Last selected preset and loudness state are stored in NVS/flash.
-- Write frequency is limited: only save after 1–2 s without changes or on a commit event.
+- Write frequency is limited: only save after 1-2 s without changes or on a commit event.
 
 **FR-13** Live parameter updates
-- Parameter updates must not cause audible clicks (20–50 ms ramp on gains/filters).
+- Parameter updates must not cause audible clicks (20-50 ms ramp on gains/filters).
 - DSP remains real-time; control tasks must not block audio tasks.
 
 **FR-14**
 Latency: control updates feel < 150 ms (best effort).
-	
+
 **FR-15**
 Stability: BLE connect/disconnect must not interrupt A2DP audio.
-	
+
 **FR-16**
 CPU budget: DSP chain within real-time budget on ESP32 (no large FFTs in v1).
-	
+
 **FR-17**
 Memory: no dynamic allocations in the audio callback.
 
@@ -149,21 +158,23 @@ GalacticStatus characteristic:
 - Length: 7 bytes
 
 | Byte | Field                   | Value   | Description                              |
-| ---- | ----------------------- | ------- | ---------------------------------------- |
+|------|-------------------------|---------|------------------------------------------|
 | 0    | protocolVersion         | 0x42    | Protocol version (always 0x42)           |
 | 1    | currentQuantumFlavor    | 0-3     | Current preset ID                        |
-| 2    | shieldStatus            | bitfield| Flags: mute, panic, loudness, limiter    |
+| 2    | shieldStatus            | bitfield| Status flags (see Section 10.5)          |
 | 3    | energyCoreLevel         | 0-100   | Reserved (placeholder)                   |
 | 4    | distortionFieldStrength | 0-100   | Volume level (placeholder)               |
 | 5    | energyCore              | 0-100   | Battery level (placeholder)              |
-| 6    | lastContact             | 0-255   | Seconds since last BLE interaction       |
+| 6    | lastContact             | 0-255   | Seconds since last BLE communication     |
 
 **FR-19**
 Last contact tracking:
 
-- The system tracks the timestamp of the last BLE interaction (read or write).
-- The `lastContact` field in GalacticStatus reports seconds since last interaction.
+- The system tracks the timestamp of the last BLE communication.
+- Communication includes: incoming reads, incoming writes, and outgoing notifications.
+- The `lastContact` field in GalacticStatus reports seconds since last communication.
 - Value is clamped to 255 (max uint8_t) for interactions older than 255 seconds.
+- When notifications are sent every 500ms, lastContact should always be 0-1.
 
 **FR-20**
 Periodic status notifications:
@@ -172,37 +183,84 @@ Periodic status notifications:
 - Notifications are sent only when a client is connected and has enabled notifications via CCCD.
 - Timer is started on BLE connect and stopped on disconnect.
 
-## 4 DSP architecture
+**FR-21**
+Mute function:
 
-### 4.1 Signal chain (v1)
-	•	Pre-gain: -6 dB
-	•	High-pass filter (HPF): protection against subsonic/unnecessary low end
-	•	Preset EQ: fixed filters per preset
-	•	Loudness overlay EQ (if enabled)
-	•	Limiter: output protection against clipping and driver overdrive
-	•	Post-gain: 0 dB (default)
+- Command 0x04 mutes/unmutes audio output completely.
+- Mute is applied with smooth gain fade (no clicks).
+- Mute state is reported in shieldStatus bit 0.
 
-### 4.2  Filter type
+**FR-22**
+Audio Duck (Panic Button):
+
+- Command 0x05 enables/disables Audio Duck mode.
+- Reduces volume to approximately 25% (-12 dB) when activated.
+- Applied with smooth gain transition.
+- Audio Duck state is reported in shieldStatus bit 1.
+- Quick toggle on/off for "panic" situations.
+
+**FR-23**
+Normalizer (Dynamic Range Compression):
+
+- Command 0x06 enables/disables the normalizer.
+- Applies dynamic range compression:
+  - Threshold: -20 dB
+  - Ratio: 4:1
+  - Attack: 7 ms
+  - Release: 150 ms
+  - Makeup gain: +6 dB
+- Makes quiet sounds louder and loud sounds quieter.
+- Perfect for late-night viewing or noisy environments.
+- Normalizer state is reported in shieldStatus bit 3.
+
+## 4 DSP Architecture
+
+### 4.1 Signal chain (v1.1)
+
+```
+Input -> Pre-gain (-6dB) -> HPF -> Preset EQ -> Loudness EQ -> Normalizer -> Limiter -> Audio Duck -> Mute -> Output
+```
+
+Components:
+1. **Pre-gain**: -6 dB headroom
+2. **High-pass filter (HPF)**: Protection against subsonic content
+3. **Preset EQ**: Fixed filters per preset (4 bands)
+4. **Loudness overlay EQ**: Optional bass/treble boost (2 bands)
+5. **Normalizer**: Optional dynamic range compression
+6. **Limiter**: Output protection against clipping
+7. **Audio Duck**: Optional volume reduction (-12 dB)
+8. **Mute**: Final output gate
+
+### 4.2 Filter type
 
 Recommended default (implementation freedom allowed): IIR biquad filters:
-	•	High-pass (2nd order)
-	•	Low-shelf / High-shelf
-	•	Peaking (bell) EQ
+- High-pass (2nd order)
+- Low-shelf / High-shelf
+- Peaking (bell) EQ
 
-### 4.3  Limiter behavior (minimum)
+### 4.3 Limiter behavior (minimum)
 
 Recommended starting values (tunable):
-	•	Threshold: -1.0 dBFS
-	•	Attack: 2–5 ms
-	•	Release: 80–200 ms
-	•	Soft-knee: mild (or equivalent)
-	
-## 8. Preset definition
+- Threshold: -1.0 dBFS
+- Attack: 2-5 ms
+- Release: 80-200 ms
+- Soft-knee: mild (or equivalent)
+
+### 4.4 Normalizer behavior
+
+Dynamic range compressor settings:
+- Threshold: -20 dBFS
+- Ratio: 4:1
+- Attack: 7 ms
+- Release: 150 ms
+- Makeup gain: +6 dB
+
+## 8. Preset Definition
 
 ### 8.1 Global defaults (always active)
 
 | Component | Parameter | Value               |
-| --------- | --------- | ------------------- |
+|-----------|-----------|---------------------|
 | Pre-gain  | Gain      | -6 dB               |
 | HPF       | Type      | 2nd-order high-pass |
 | HPF       | Fc        | 95 Hz (default)     |
@@ -212,64 +270,57 @@ Recommended starting values (tunable):
 
 ### 8.2 Preset: OFFICE (office/background)
 
-| #    | Type       |      Fc |    Gain | Q / Slope |
-| ---- | ---------- | ------: | ------: | --------- |
-| 1    | Low-shelf  |  160 Hz | +1.5 dB | S=0.7     |
-| 2    | Peaking    |  320 Hz | -1.0 dB | Q=1.0     |
-| 3    | Peaking    | 2800 Hz | -1.5 dB | Q=1.0     |
-| 4    | High-shelf | 9000 Hz | +0.5 dB | S=0.7     |
-
+| #   | Type       |      Fc |    Gain | Q / Slope |
+|-----|------------|--------:|--------:|-----------|
+| 1   | Low-shelf  |  160 Hz | +1.5 dB | S=0.7     |
+| 2   | Peaking    |  320 Hz | -1.0 dB | Q=1.0     |
+| 3   | Peaking    | 2800 Hz | -1.5 dB | Q=1.0     |
+| 4   | High-shelf | 9000 Hz | +0.5 dB | S=0.7     |
 
 ### 8.3 Preset: FULL (full/rich)
 
-| #    | Type       |      Fc |    Gain | Q / Slope |
-| ---- | ---------- | ------: | ------: | --------- |
-| 1    | Low-shelf  |  140 Hz | +4.0 dB | S=0.8     |
-| 2    | Peaking    |  420 Hz | -1.5 dB | Q=1.0     |
-| 3    | Peaking    | 3200 Hz | +0.7 dB | Q=1.0     |
-| 4    | High-shelf | 9500 Hz | +1.5 dB | S=0.7     |
+| #   | Type       |      Fc |    Gain | Q / Slope |
+|-----|------------|--------:|--------:|-----------|
+| 1   | Low-shelf  |  140 Hz | +4.0 dB | S=0.8     |
+| 2   | Peaking    |  420 Hz | -1.5 dB | Q=1.0     |
+| 3   | Peaking    | 3200 Hz | +0.7 dB | Q=1.0     |
+| 4   | High-shelf | 9500 Hz | +1.5 dB | S=0.7     |
 
 ### 8.4 Preset: NIGHT (low volume / evening)
 
-| #    | Type       |      Fc |    Gain | Q / Slope |
-| ---- | ---------- | ------: | ------: | --------- |
-| 1    | Low-shelf  |  160 Hz | +2.5 dB | S=0.8     |
-| 2    | Peaking    |  350 Hz | -1.0 dB | Q=1.0     |
-| 3    | Peaking    | 2500 Hz | +1.0 dB | Q=1.0     |
-| 4    | High-shelf | 9000 Hz | +1.0 dB | S=0.7     |
+| #   | Type       |      Fc |    Gain | Q / Slope |
+|-----|------------|--------:|--------:|-----------|
+| 1   | Low-shelf  |  160 Hz | +2.5 dB | S=0.8     |
+| 2   | Peaking    |  350 Hz | -1.0 dB | Q=1.0     |
+| 3   | Peaking    | 2500 Hz | +1.0 dB | Q=1.0     |
+| 4   | High-shelf | 9000 Hz | +1.0 dB | S=0.7     |
 
-### 8.5 Preset: SPEECH (optional)
+### 8.5 Preset: SPEECH (podcast/speech)
 
-| #    | Type      |      Fc |    Gain | Q / Slope |
-| ---- | --------- | ------: | ------: | --------- |
-| 1    | Low-shelf |  170 Hz | -2.0 dB | S=0.8     |
-| 2    | Peaking   |  300 Hz | -1.0 dB | Q=1.0     |
-| 3    | Peaking   | 3200 Hz | +3.0 dB | Q=1.0     |
-| 4    | Peaking   | 7500 Hz | -1.0 dB | Q=2.0     |
+| #   | Type      |      Fc |    Gain | Q / Slope |
+|-----|-----------|--------:|--------:|-----------|
+| 1   | Low-shelf |  170 Hz | -2.0 dB | S=0.8     |
+| 2   | Peaking   |  300 Hz | -1.0 dB | Q=1.0     |
+| 3   | Peaking   | 3200 Hz | +3.0 dB | Q=1.0     |
+| 4   | Peaking   | 7500 Hz | -1.0 dB | Q=2.0     |
 
-## 9. Loudness overlay (v1)
+## 9. Loudness Overlay (v1)
 
 ### 9.1 Definition (on/off)
 
 When Loudness is ON, an extra EQ overlay is applied on top of the preset.
 
-| #    | Type       |      Fc |    Gain | Q / Slope |
-| ---- | ---------- | ------: | ------: | --------- |
-| L1   | Low-shelf  |  140 Hz | +2.5 dB | S=0.8     |
-| L2   | High-shelf | 8500 Hz | +1.0 dB | S=0.7     |
+| #   | Type       |      Fc |    Gain | Q / Slope |
+|-----|------------|--------:|--------:|-----------|
+| L1  | Low-shelf  |  140 Hz | +2.5 dB | S=0.8     |
+| L2  | High-shelf | 8500 Hz | +1.0 dB | S=0.7     |
 
 ### 9.2 Constraints
 
-- Loudness must not make “FULL + Loudness” extremely boomy; overlay is intentionally mild.
+- Loudness must not make "FULL + Loudness" extremely boomy; overlay is intentionally mild.
 - Implementation must apply parameter smoothing when toggling.
 
-Optional: Loudness strength
-
-- 0: off  
-- 1: mild (gains above)  
-- 2: normal (**+3.5 dB** low-shelf, **+1.5 dB** high-shelf)
-
-## 10. BLE GATT interface
+## 10. BLE GATT Interface
 
 ### 10.1 Goal
 
@@ -283,84 +334,101 @@ The service UUID is included in BLE advertising packets for service discovery.
 
 **Characteristics:**
 
-| Characteristic   | UUID                                     | Properties              | Size    |
-| ---------------- | ---------------------------------------- | ----------------------- | ------- |
-| CONTROL_WRITE    | `00000002-1234-5678-9ABC-DEF012345678`   | Write, Write No Response| 2 bytes |
-| STATUS_NOTIFY    | `00000003-1234-5678-9ABC-DEF012345678`   | Read, Notify            | 4 bytes |
-| GALACTIC_STATUS  | `00000004-1234-5678-9ABC-DEF012345678`   | Read, Notify            | 7 bytes |
+| Characteristic   | UUID                                   | Properties               | Size    |
+|------------------|----------------------------------------|--------------------------|---------|
+| CONTROL_WRITE    | `00000002-1234-5678-9ABC-DEF012345678` | Write, Write No Response | 2 bytes |
+| STATUS_NOTIFY    | `00000003-1234-5678-9ABC-DEF012345678` | Read, Notify             | 4 bytes |
+| GALACTIC_STATUS  | `00000004-1234-5678-9ABC-DEF012345678` | Read, Notify             | 7 bytes |
 
-### 10.3 Control protocol (v1 – 2-byte commands)
+### 10.3 Control Protocol (2-byte commands)
 
 Format: **[CMD (1 byte)] [VAL (1 byte)]**
 
-|  CMD | Name         |  VAL | Meaning                              |
-| ---: | ------------ | ---: | ------------------------------------ |
-| 0x01 | SET_PRESET   | 0..3 | 0=OFFICE, 1=FULL, 2=NIGHT, 3=SPEECH  |
-| 0x02 | SET_LOUDNESS |  0/1 | 0=OFF, 1=ON                          |
-| 0x03 | GET_STATUS   |    0 | Triggers immediate notify (optional) |
+| CMD  | Name           | VAL  | Meaning                              |
+|-----:|----------------|-----:|--------------------------------------|
+| 0x01 | SET_PRESET     | 0..3 | 0=OFFICE, 1=FULL, 2=NIGHT, 3=SPEECH  |
+| 0x02 | SET_LOUDNESS   |  0/1 | 0=OFF, 1=ON                          |
+| 0x03 | GET_STATUS     |    0 | Triggers immediate notify            |
+| 0x04 | SET_MUTE       |  0/1 | 0=Unmute, 1=Mute                     |
+| 0x05 | SET_AUDIO_DUCK |  0/1 | 0=OFF, 1=ON (reduces volume to ~25%) |
+| 0x06 | SET_NORMALIZER |  0/1 | 0=OFF, 1=ON (enables DRC)            |
 
 Behavior:
 
 - Each valid write results in a DSP update (with smoothing).
 - STATUS_NOTIFY sends (notify) the current state after each change.
+- GalacticStatus is updated and notified after each command.
 
-### 10.4 Status payload (v1 – 4 bytes)
+### 10.4 Status Payload (4 bytes)
 
 Format: **[VER][PRESET][LOUDNESS][FLAGS]**
 
-| Byte | Field    | Value  | Description                        |
-| ---- | -------- | ------ | ---------------------------------- |
-| 0    | VER      | 0x01   | Protocol version                   |
-| 1    | PRESET   | 0-3    | Current preset ID                  |
-| 2    | LOUDNESS | 0/1    | Loudness off/on                    |
-| 3    | FLAGS    | bitfield| Status flags                      |
+| Byte | Field    | Value   | Description           |
+|------|----------|---------|----------------------|
+| 0    | VER      | 0x01    | Protocol version     |
+| 1    | PRESET   | 0-3     | Current preset ID    |
+| 2    | LOUDNESS | 0/1     | Loudness off/on      |
+| 3    | FLAGS    | bitfield| Status flags         |
 
 FLAGS bitfield:
 - bit0: limiter active (always 1)
 - bit1: clipping detected (optional)
 - bit2: thermal warning (optional)
-- bit3-7: reserved (0)
+- bit3: muted
+- bit4: audio duck active
+- bit5: normalizer active
+- bit6-7: reserved (0)
 
-### 10.5 GalacticStatus payload (v1 – 7 bytes)
+### 10.5 GalacticStatus Payload (7 bytes)
 
 Format: **[VER][PRESET][FLAGS][ENERGY][VOLUME][BATTERY][LAST_CONTACT]**
 
-| Byte | Field         | Value   | Description                        |
-| ---- | ------------- | ------- | ---------------------------------- |
-| 0    | VER           | 0x42    | Protocol version (always 0x42)     |
-| 1    | PRESET        | 0-3     | Current preset (QuantumFlavor)     |
-| 2    | FLAGS         | bitfield| Shield status flags                |
-| 3    | ENERGY        | 0-100   | Energy core level (reserved)       |
-| 4    | VOLUME        | 0-100   | Distortion field strength (reserved)|
-| 5    | BATTERY       | 0-100   | Energy core/battery (reserved)     |
-| 6    | LAST_CONTACT  | 0-255   | Seconds since last BLE interaction |
+| Byte | Field        | Value   | Description                           |
+|------|--------------|---------|---------------------------------------|
+| 0    | VER          | 0x42    | Protocol version (always 0x42)        |
+| 1    | PRESET       | 0-3     | Current preset (QuantumFlavor)        |
+| 2    | FLAGS        | bitfield| Shield status flags                   |
+| 3    | ENERGY       | 0-100   | Energy core level (reserved)          |
+| 4    | VOLUME       | 0-100   | Distortion field strength (reserved)  |
+| 5    | BATTERY      | 0-100   | Energy core/battery (reserved)        |
+| 6    | LAST_CONTACT | 0-255   | Seconds since last BLE communication  |
+
+**Shield Status FLAGS (byte 2) bitfield:**
+
+| Bit | Mask | Field      | Description                         |
+|-----|------|------------|-------------------------------------|
+| 0   | 0x01 | Muted      | Audio is muted                      |
+| 1   | 0x02 | Audio Duck | Volume reduced (panic mode)         |
+| 2   | 0x04 | Loudness   | Loudness compensation enabled       |
+| 3   | 0x08 | Normalizer | Dynamic range compression enabled   |
+| 4-7 | -    | Reserved   | Future use                          |
 
 This characteristic is automatically notified every 500ms (FR-20) when notifications are enabled.
 
-### 10.6 BLE advertising configuration
+### 10.6 BLE Advertising Configuration
 
-| Parameter        | Value            | Description                         |
-| ---------------- | ---------------- | ----------------------------------- |
-| Device Name      | "ESP32 Speaker"  | Advertised BLE device name          |
-| Adv Interval Min | 20ms (0x20)      | Minimum advertising interval        |
-| Adv Interval Max | 40ms (0x40)      | Maximum advertising interval        |
-| Appearance       | 0x0841           | BLE Speaker appearance              |
-| Service UUID     | Included         | Service UUID in advertising packet  |
+| Parameter        | Value           | Description                        |
+|------------------|-----------------|------------------------------------|
+| Device Name      | "ESP32 Speaker" | Advertised BLE device name         |
+| Adv Interval Min | 20ms (0x20)     | Minimum advertising interval       |
+| Adv Interval Max | 40ms (0x40)     | Maximum advertising interval       |
+| Appearance       | 0x0841          | BLE Speaker appearance             |
+| Service UUID     | Included        | Service UUID in advertising packet |
 
 The advertising packet contains the service UUID for filtering/discovery. The scan response contains the device name and TX power.
 
-### 10.7 Connection parameters
+### 10.7 Connection Parameters
 
 On connection, the following parameters are requested to optimize latency (FR-14):
 
-| Parameter        | Value      | Description                         |
-| ---------------- | ---------- | ----------------------------------- |
-| Min Interval     | 20ms       | Minimum connection interval         |
-| Max Interval     | 40ms       | Maximum connection interval         |
-| Latency          | 0          | Slave latency (no skipped events)   |
-| Timeout          | 4000ms     | Supervision timeout                 |
+| Parameter    | Value   | Description                       |
+|--------------|---------|-----------------------------------|
+| Min Interval | 20ms    | Minimum connection interval       |
+| Max Interval | 40ms    | Maximum connection interval       |
+| Latency      | 0       | Slave latency (no skipped events) |
+| Timeout      | 4000ms  | Supervision timeout               |
 
-## 11. State machine and error handling
+## 11. State Machine and Error Handling
 
 ### 11.1 BLE connect/disconnect
 
@@ -393,9 +461,9 @@ On connection, the following parameters are requested to optimize latency (FR-14
 ### 12.2 Write policy
 
 - Do not flash on every BLE write.
-- Debounce: write after **1–2 seconds** without new changes.
+- Debounce: write after **1-2 seconds** without new changes.
 
-## 13. Performance and real-time requirements
+## 13. Performance and Real-time Requirements
 
 ### 13.1 Audio task priority
 
@@ -404,6 +472,6 @@ On connection, the following parameters are requested to optimize latency (FR-14
 
 ### 13.2 Parameter smoothing
 
-- On preset change: crossfade/parameter ramp (**20–50 ms**) to prevent clicks.
+- On preset change: crossfade/parameter ramp (**20-50 ms**) to prevent clicks.
 - Filter coefficient updates: switch in one go with output ramp, or interpolate per block.
-
+- Mute, Audio Duck, and Normalizer use smooth gain transitions.

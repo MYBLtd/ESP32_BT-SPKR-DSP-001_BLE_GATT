@@ -50,6 +50,9 @@ typedef struct {
 #define DSP_FLAG_LIMITER_ACTIVE   (1 << 0)
 #define DSP_FLAG_CLIPPING         (1 << 1)
 #define DSP_FLAG_THERMAL_WARN     (1 << 2)
+#define DSP_FLAG_MUTED            (1 << 3)
+#define DSP_FLAG_AUDIO_DUCK       (1 << 4)  /* FR-21: Audio duck (panic) active */
+#define DSP_FLAG_NORMALIZER       (1 << 5)  /* FR-22: Normalizer/DRC active */
 
 /*
  * Biquad filter coefficients
@@ -104,6 +107,16 @@ typedef struct {
 #define DSP_LIMITER_ATTACK_MS   3.0f
 #define DSP_LIMITER_RELEASE_MS  120.0f
 
+/* Audio Duck settings (FR-21) */
+#define DSP_AUDIO_DUCK_GAIN_DB  (-12.0f) /* ~25% volume reduction */
+
+/* Normalizer/DRC settings (FR-22) */
+#define DSP_NORMALIZER_THRESHOLD_DB (-20.0f)
+#define DSP_NORMALIZER_RATIO        4.0f    /* 4:1 compression ratio */
+#define DSP_NORMALIZER_ATTACK_MS    7.0f    /* 5-10 ms attack */
+#define DSP_NORMALIZER_RELEASE_MS   150.0f  /* 100-200 ms release */
+#define DSP_NORMALIZER_MAKEUP_DB    6.0f    /* Makeup gain to compensate */
+
 /*
  * Initialize DSP processor
  * Must be called before processing audio
@@ -153,6 +166,55 @@ esp_err_t dsp_set_loudness(bool enabled);
  * @return true if loudness is enabled
  */
 bool dsp_get_loudness(void);
+
+/*
+ * Set mute state
+ * Silences audio output when enabled
+ *
+ * @param muted true to mute, false to unmute
+ * @return ESP_OK on success
+ */
+esp_err_t dsp_set_mute(bool muted);
+
+/*
+ * Get mute state
+ *
+ * @return true if muted
+ */
+bool dsp_get_mute(void);
+
+/*
+ * Set audio duck state (FR-21)
+ * Reduces volume to ~25-30% when enabled (panic button)
+ *
+ * @param enabled true to enable audio duck
+ * @return ESP_OK on success
+ */
+esp_err_t dsp_set_audio_duck(bool enabled);
+
+/*
+ * Get audio duck state
+ *
+ * @return true if audio duck is enabled
+ */
+bool dsp_get_audio_duck(void);
+
+/*
+ * Set normalizer state (FR-22)
+ * Enables dynamic range compression when active
+ * Makes quiet sounds louder and loud sounds quieter
+ *
+ * @param enabled true to enable normalizer
+ * @return ESP_OK on success
+ */
+esp_err_t dsp_set_normalizer(bool enabled);
+
+/*
+ * Get normalizer state
+ *
+ * @return true if normalizer is enabled
+ */
+bool dsp_get_normalizer(void);
 
 /*
  * Get DSP status for BLE notification
