@@ -2,11 +2,16 @@
 
 A Bluetooth audio receiver with real-time DSP processing and BLE GATT control interface for ESP32.
 
+**Version:** 1.1 | **Date:** 2026-01-22
+
 ## Features
 
 - **Bluetooth A2DP Sink** - Receive high-quality audio from phones, tablets, and computers
-- **Real-time DSP Processing** - EQ presets, loudness enhancement, and output limiting
-- **BLE GATT Control** - Change DSP settings wirelessly using any generic BLE app
+- **Real-time DSP Processing** - EQ presets, loudness enhancement, normalizer, and output limiting
+- **BLE GATT Control** - Change DSP settings wirelessly using any generic BLE app or the 42 Decibels iOS app
+- **Mute & Audio Duck** - Instant mute and panic button for quick volume reduction
+- **Normalizer (DRC)** - Dynamic range compression for late-night listening
+- **GalacticStatus** - Extended status reporting with periodic notifications (2x/sec)
 - **Persistent Settings** - Settings survive power cycles via NVS flash storage
 - **iOS Compatible** - Secure Simple Pairing (SSP) for seamless iOS pairing
 
@@ -86,10 +91,11 @@ DSP Control Service: 00000001-1234-5678-9ABC-DEF012345678
 
 ### Characteristics
 
-| Characteristic | UUID | Properties |
-|----------------|------|------------|
-| Control Write | `00000002-1234-5678-...` | Write, Write Without Response |
-| Status Notify | `00000003-1234-5678-...` | Read, Notify |
+| Characteristic | UUID | Properties | Size |
+|----------------|------|------------|------|
+| Control Write | `00000002-1234-5678-9ABC-DEF012345678` | Write, Write Without Response | 2 bytes |
+| Status Notify | `00000003-1234-5678-9ABC-DEF012345678` | Read, Notify | 4 bytes |
+| GalacticStatus | `00000004-1234-5678-9ABC-DEF012345678` | Read, Notify | 7 bytes |
 
 ### Command Format
 
@@ -104,17 +110,53 @@ Commands are 2 bytes: `[CMD] [VALUE]`
 | `0x02` | SET_LOUDNESS | `0x00` | Loudness OFF |
 | `0x02` | SET_LOUDNESS | `0x01` | Loudness ON |
 | `0x03` | GET_STATUS | `0x00` | Request status notification |
+| `0x04` | SET_MUTE | `0x00` | Unmute audio |
+| `0x04` | SET_MUTE | `0x01` | Mute audio |
+| `0x05` | SET_AUDIO_DUCK | `0x00` | Audio Duck OFF |
+| `0x05` | SET_AUDIO_DUCK | `0x01` | Audio Duck ON (reduces volume to ~25%) |
+| `0x06` | SET_NORMALIZER | `0x00` | Normalizer OFF |
+| `0x06` | SET_NORMALIZER | `0x01` | Normalizer ON (dynamic range compression) |
 
-### Status Notification Format
+### Status Notification Format (4 bytes)
 
-4 bytes: `[VERSION] [PRESET] [LOUDNESS] [FLAGS]`
+Format: `[VERSION] [PRESET] [LOUDNESS] [FLAGS]`
 
 | Byte | Description |
 |------|-------------|
 | VERSION | Protocol version (0x01) |
 | PRESET | Current preset (0-3) |
 | LOUDNESS | Loudness state (0/1) |
-| FLAGS | Bit 0: Limiter active, Bit 1: Clipping detected |
+| FLAGS | Status bitfield (see below) |
+
+**FLAGS bitfield:**
+- Bit 0: Limiter active (always 1)
+- Bit 1: Clipping detected
+- Bit 2: Thermal warning
+- Bit 3: Muted
+- Bit 4: Audio Duck active
+- Bit 5: Normalizer active
+
+### GalacticStatus Format (7 bytes)
+
+Extended status with periodic notifications (every 500ms when subscribed).
+
+Format: `[VER] [PRESET] [FLAGS] [ENERGY] [VOLUME] [BATTERY] [LAST_CONTACT]`
+
+| Byte | Field | Description |
+|------|-------|-------------|
+| 0 | VER | Protocol version (always 0x42) |
+| 1 | PRESET | Current preset (0-3) |
+| 2 | FLAGS | Shield status bitfield |
+| 3 | ENERGY | Reserved (0-100) |
+| 4 | VOLUME | Reserved (0-100) |
+| 5 | BATTERY | Reserved (0-100) |
+| 6 | LAST_CONTACT | Seconds since last BLE communication (0-255) |
+
+**Shield Status FLAGS (byte 2):**
+- Bit 0 (0x01): Muted
+- Bit 1 (0x02): Audio Duck active
+- Bit 2 (0x04): Loudness enabled
+- Bit 3 (0x08): Normalizer enabled
 
 ### Example Commands (Hex)
 
@@ -126,6 +168,12 @@ Commands are 2 bytes: `[CMD] [VALUE]`
 0200  - Disable loudness
 0201  - Enable loudness
 0300  - Request status
+0400  - Unmute
+0401  - Mute
+0500  - Audio Duck OFF
+0501  - Audio Duck ON (panic button)
+0600  - Normalizer OFF
+0601  - Normalizer ON
 ```
 
 ## DSP Architecture
@@ -133,7 +181,7 @@ Commands are 2 bytes: `[CMD] [VALUE]`
 ### Signal Chain
 
 ```
-Input → Pre-gain (-6dB) → HPF (95Hz) → Preset EQ → Loudness EQ → Limiter → Output
+Input → Pre-gain (-6dB) → HPF (95Hz) → Preset EQ → Loudness EQ → Normalizer → Limiter → Audio Duck → Mute → Output
 ```
 
 ### Components
@@ -142,7 +190,10 @@ Input → Pre-gain (-6dB) → HPF (95Hz) → Preset EQ → Loudness EQ → Limit
 2. **High-pass Filter**: 2nd-order Butterworth at 95 Hz (driver protection)
 3. **Preset EQ**: 4-band parametric EQ per preset
 4. **Loudness Overlay**: 2-band shelf EQ (bass + treble boost)
-5. **Limiter**: Peak limiter at -1 dBFS (3ms attack, 120ms release)
+5. **Normalizer**: Dynamic range compression (threshold -20dB, ratio 4:1, +6dB makeup)
+6. **Limiter**: Peak limiter at -1 dBFS (3ms attack, 120ms release)
+7. **Audio Duck**: Volume reduction to ~25% (-12 dB) when activated
+8. **Mute**: Final output gate
 
 ### Preset EQ Curves
 
@@ -227,7 +278,7 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 - **EQ Curves**: Edit `preset_params` array in `dsp_processor.c`
 - **Limiter Settings**: Adjust `DSP_LIMITER_*` defines in `dsp_processor.h`
 
-## Functional Requirements (FSD-DSP-001)
+## Functional Requirements (FSD-DSP-001 v1.1)
 
 | ID | Requirement | Status |
 |----|-------------|--------|
@@ -246,6 +297,12 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 | FR-15 | BLE stability (no A2DP interruption) | ✅ |
 | FR-16 | Real-time DSP budget | ✅ |
 | FR-17 | No dynamic allocation in audio path | ✅ |
+| FR-18 | GalacticStatus characteristic (7 bytes) | ✅ |
+| FR-19 | Last contact tracking | ✅ |
+| FR-20 | Periodic status notifications (500ms) | ✅ |
+| FR-21 | Mute function with smooth fade | ✅ |
+| FR-22 | Audio Duck (panic button, -12 dB) | ✅ |
+| FR-23 | Normalizer (dynamic range compression) | ✅ |
 
 ## License
 

@@ -119,6 +119,24 @@ typedef struct {
     float pre_gain_target;
     float loudness_gain;        /* 0.0 = off, 1.0 = on */
     float loudness_gain_target;
+    float mute_gain;            /* 1.0 = unmuted, 0.0 = muted */
+    float mute_gain_target;
+    bool muted;                 /* Mute state */
+
+    /* Audio Duck (FR-21) - panic button volume reduction */
+    bool audio_duck_enabled;
+    float audio_duck_gain;
+    float audio_duck_gain_target;
+
+    /* Normalizer/DRC (FR-22) - dynamic range compression */
+    bool normalizer_enabled;
+    float normalizer_envelope;
+    float normalizer_gain;
+    float normalizer_threshold;
+    float normalizer_ratio;
+    float normalizer_attack_coeff;
+    float normalizer_release_coeff;
+    float normalizer_makeup_gain;
 
     /* Smoothing coefficient */
     float smooth_coeff;
@@ -294,6 +312,10 @@ static void update_filters(dsp_state_t *dsp)
     /* Limiter */
     calc_limiter_coeffs(dsp);
 
+    /* Normalizer/DRC coefficients (FR-22) */
+    dsp->normalizer_attack_coeff = calc_smooth_coeff(DSP_NORMALIZER_ATTACK_MS, fs);
+    dsp->normalizer_release_coeff = calc_smooth_coeff(DSP_NORMALIZER_RELEASE_MS, fs);
+
     /* Smoothing coefficient */
     dsp->smooth_coeff = calc_smooth_coeff(DSP_SMOOTHING_MS, fs);
 }
@@ -319,6 +341,22 @@ esp_err_t dsp_init(uint32_t sample_rate)
     s_dsp.pre_gain_target = s_dsp.pre_gain;
     s_dsp.loudness_gain = 0.0f;
     s_dsp.loudness_gain_target = 0.0f;
+    s_dsp.mute_gain = 1.0f;     /* Start unmuted */
+    s_dsp.mute_gain_target = 1.0f;
+    s_dsp.muted = false;
+
+    /* Initialize Audio Duck (FR-21) */
+    s_dsp.audio_duck_enabled = false;
+    s_dsp.audio_duck_gain = 1.0f;
+    s_dsp.audio_duck_gain_target = 1.0f;
+
+    /* Initialize Normalizer/DRC (FR-22) */
+    s_dsp.normalizer_enabled = false;
+    s_dsp.normalizer_envelope = 0.0f;
+    s_dsp.normalizer_gain = 1.0f;
+    s_dsp.normalizer_threshold = DB_TO_LINEAR(DSP_NORMALIZER_THRESHOLD_DB);
+    s_dsp.normalizer_ratio = DSP_NORMALIZER_RATIO;
+    s_dsp.normalizer_makeup_gain = DB_TO_LINEAR(DSP_NORMALIZER_MAKEUP_DB);
 
     /* Initialize limiter */
     s_dsp.limiter.envelope = 0.0f;
@@ -436,6 +474,78 @@ bool dsp_get_loudness(void)
     return s_dsp.loudness_enabled;
 }
 
+esp_err_t dsp_set_mute(bool muted)
+{
+    if (!s_dsp.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (muted == s_dsp.muted) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Setting mute: %s", muted ? "ON" : "OFF");
+    s_dsp.muted = muted;
+    s_dsp.mute_gain_target = muted ? 0.0f : 1.0f;
+
+    return ESP_OK;
+}
+
+bool dsp_get_mute(void)
+{
+    return s_dsp.muted;
+}
+
+esp_err_t dsp_set_audio_duck(bool enabled)
+{
+    if (!s_dsp.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (enabled == s_dsp.audio_duck_enabled) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Setting audio duck: %s", enabled ? "ON" : "OFF");
+    s_dsp.audio_duck_enabled = enabled;
+    /* ~25% volume = -12 dB reduction when enabled */
+    s_dsp.audio_duck_gain_target = enabled ? DB_TO_LINEAR(DSP_AUDIO_DUCK_GAIN_DB) : 1.0f;
+
+    return ESP_OK;
+}
+
+bool dsp_get_audio_duck(void)
+{
+    return s_dsp.audio_duck_enabled;
+}
+
+esp_err_t dsp_set_normalizer(bool enabled)
+{
+    if (!s_dsp.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (enabled == s_dsp.normalizer_enabled) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Setting normalizer: %s", enabled ? "ON" : "OFF");
+    s_dsp.normalizer_enabled = enabled;
+
+    /* Reset normalizer state when toggling */
+    if (enabled) {
+        s_dsp.normalizer_envelope = 0.0f;
+        s_dsp.normalizer_gain = 1.0f;
+    }
+
+    return ESP_OK;
+}
+
+bool dsp_get_normalizer(void)
+{
+    return s_dsp.normalizer_enabled;
+}
+
 void dsp_get_status(dsp_status_t *status)
 {
     if (status == NULL) {
@@ -445,6 +555,18 @@ void dsp_get_status(dsp_status_t *status)
     status->preset = (uint8_t)s_dsp.preset;
     status->loudness = s_dsp.loudness_enabled ? 1 : 0;
     status->flags = DSP_FLAG_LIMITER_ACTIVE;  /* Limiter is always active */
+
+    if (s_dsp.muted) {
+        status->flags |= DSP_FLAG_MUTED;
+    }
+
+    if (s_dsp.audio_duck_enabled) {
+        status->flags |= DSP_FLAG_AUDIO_DUCK;
+    }
+
+    if (s_dsp.normalizer_enabled) {
+        status->flags |= DSP_FLAG_NORMALIZER;
+    }
 
     if (s_dsp.clipping_detected) {
         status->flags |= DSP_FLAG_CLIPPING;
@@ -520,6 +642,35 @@ void dsp_process(int16_t *samples, uint32_t num_samples)
             right = right * (1.0f - s_dsp.loudness_gain) + loud_right * s_dsp.loudness_gain;
         }
 
+        /* Normalizer/DRC (FR-22) - dynamic range compression */
+        if (s_dsp.normalizer_enabled) {
+            float norm_peak = fmaxf(fabsf(left), fabsf(right));
+
+            /* Update envelope with attack/release */
+            if (norm_peak > s_dsp.normalizer_envelope) {
+                s_dsp.normalizer_envelope += s_dsp.normalizer_attack_coeff *
+                                            (norm_peak - s_dsp.normalizer_envelope);
+            } else {
+                s_dsp.normalizer_envelope += s_dsp.normalizer_release_coeff *
+                                            (norm_peak - s_dsp.normalizer_envelope);
+            }
+
+            /* Calculate compression gain */
+            if (s_dsp.normalizer_envelope > s_dsp.normalizer_threshold) {
+                /* Compression: gain = threshold / envelope^(1 - 1/ratio) */
+                /* For ratio 4:1: if input is 4dB above threshold, output is 1dB above */
+                float over_threshold = s_dsp.normalizer_envelope / s_dsp.normalizer_threshold;
+                float compressed = powf(over_threshold, 1.0f - 1.0f / s_dsp.normalizer_ratio);
+                s_dsp.normalizer_gain = 1.0f / compressed;
+            } else {
+                s_dsp.normalizer_gain = 1.0f;
+            }
+
+            /* Apply compression gain and makeup gain */
+            left *= s_dsp.normalizer_gain * s_dsp.normalizer_makeup_gain;
+            right *= s_dsp.normalizer_gain * s_dsp.normalizer_makeup_gain;
+        }
+
         /* Limiter (FR-11) - soft-knee peak limiter */
         float peak = fmaxf(fabsf(left), fabsf(right));
 
@@ -551,6 +702,16 @@ void dsp_process(int16_t *samples, uint32_t num_samples)
             left = fmaxf(-1.0f, fminf(1.0f, left));
             right = fmaxf(-1.0f, fminf(1.0f, right));
         }
+
+        /* Audio Duck (FR-21) - smooth volume reduction for panic button */
+        s_dsp.audio_duck_gain += s_dsp.smooth_coeff * (s_dsp.audio_duck_gain_target - s_dsp.audio_duck_gain);
+        left *= s_dsp.audio_duck_gain;
+        right *= s_dsp.audio_duck_gain;
+
+        /* Apply mute with smooth fade */
+        s_dsp.mute_gain += s_dsp.smooth_coeff * (s_dsp.mute_gain_target - s_dsp.mute_gain);
+        left *= s_dsp.mute_gain;
+        right *= s_dsp.mute_gain;
 
         /* Convert back to int16 */
         samples[i * 2] = FLOAT_TO_INT16(left);
@@ -590,6 +751,29 @@ void dsp_process_float(float *left, float *right, uint32_t num_frames)
             }
         }
 
+        /* Normalizer/DRC (FR-22) */
+        if (s_dsp.normalizer_enabled) {
+            float norm_peak = fmaxf(fabsf(l), fabsf(r));
+            if (norm_peak > s_dsp.normalizer_envelope) {
+                s_dsp.normalizer_envelope += s_dsp.normalizer_attack_coeff *
+                                            (norm_peak - s_dsp.normalizer_envelope);
+            } else {
+                s_dsp.normalizer_envelope += s_dsp.normalizer_release_coeff *
+                                            (norm_peak - s_dsp.normalizer_envelope);
+            }
+
+            if (s_dsp.normalizer_envelope > s_dsp.normalizer_threshold) {
+                float over_threshold = s_dsp.normalizer_envelope / s_dsp.normalizer_threshold;
+                float compressed = powf(over_threshold, 1.0f - 1.0f / s_dsp.normalizer_ratio);
+                s_dsp.normalizer_gain = 1.0f / compressed;
+            } else {
+                s_dsp.normalizer_gain = 1.0f;
+            }
+
+            l *= s_dsp.normalizer_gain * s_dsp.normalizer_makeup_gain;
+            r *= s_dsp.normalizer_gain * s_dsp.normalizer_makeup_gain;
+        }
+
         /* Limiter */
         float peak = fmaxf(fabsf(l), fabsf(r));
         if (peak > s_dsp.limiter.envelope) {
@@ -606,6 +790,14 @@ void dsp_process_float(float *left, float *right, uint32_t num_frames)
 
         l *= s_dsp.limiter.gain;
         r *= s_dsp.limiter.gain;
+
+        /* Audio Duck (FR-21) */
+        l *= s_dsp.audio_duck_gain;
+        r *= s_dsp.audio_duck_gain;
+
+        /* Apply mute */
+        l *= s_dsp.mute_gain;
+        r *= s_dsp.mute_gain;
 
         left[i] = fmaxf(-1.0f, fminf(1.0f, l));
         right[i] = fmaxf(-1.0f, fminf(1.0f, r));
