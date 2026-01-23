@@ -58,6 +58,30 @@ extern "C" {
     0x78, 0x56, 0x34, 0x12, 0x04, 0x00, 0x00, 0x00 \
 }
 
+/* OTA Credentials Characteristic UUID: 00000005-1234-5678-9ABC-DEF012345678 */
+#define OTA_CREDS_CHAR_UUID_128 { \
+    0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, \
+    0x78, 0x56, 0x34, 0x12, 0x05, 0x00, 0x00, 0x00 \
+}
+
+/* OTA URL Characteristic UUID: 00000006-1234-5678-9ABC-DEF012345678 */
+#define OTA_URL_CHAR_UUID_128 { \
+    0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, \
+    0x78, 0x56, 0x34, 0x12, 0x06, 0x00, 0x00, 0x00 \
+}
+
+/* OTA Control Characteristic UUID: 00000007-1234-5678-9ABC-DEF012345678 */
+#define OTA_CONTROL_CHAR_UUID_128 { \
+    0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, \
+    0x78, 0x56, 0x34, 0x12, 0x07, 0x00, 0x00, 0x00 \
+}
+
+/* OTA Status Characteristic UUID: 00000008-1234-5678-9ABC-DEF012345678 */
+#define OTA_STATUS_CHAR_UUID_128 { \
+    0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, \
+    0x78, 0x56, 0x34, 0x12, 0x08, 0x00, 0x00, 0x00 \
+}
+
 /*
  * Control Protocol (Section 10.3)
  * Format: [CMD (1 byte)] [VAL (1 byte)]
@@ -69,6 +93,25 @@ extern "C" {
 #define DSP_CMD_SET_AUDIO_DUCK  0x05    /* VAL: 0/1 (off/on) - FR-21: reduces volume to ~25% */
 #define DSP_CMD_SET_NORMALIZER  0x06    /* VAL: 0/1 (off/on) - FR-22: dynamic range compression */
 #define DSP_CMD_SET_VOLUME      0x07    /* VAL: 0-100 (volume trim) - FR-24: device volume control */
+
+/*
+ * OTA Commands (Section 10.5)
+ * Sent to OTA Control characteristic (0x0007)
+ */
+#define OTA_CMD_START           0x10    /* Start OTA process */
+#define OTA_CMD_CANCEL          0x11    /* Cancel OTA */
+#define OTA_CMD_REBOOT          0x12    /* Reboot to new firmware */
+#define OTA_CMD_GET_VERSION     0x13    /* Get firmware version */
+#define OTA_CMD_ROLLBACK        0x14    /* Rollback to previous firmware */
+#define OTA_CMD_VALIDATE        0x15    /* Mark new firmware as valid */
+
+/*
+ * OTA Characteristic Sizes
+ */
+#define OTA_CREDS_MAX_SIZE      98      /* SSID (32) + separator (1) + password (64) + padding (1) */
+#define OTA_URL_MAX_SIZE        258     /* URL (256) + length prefix (2) */
+#define OTA_CONTROL_SIZE        2       /* CMD (1) + param (1) */
+#define OTA_STATUS_SIZE         8       /* State, error, progress, sizes, RSSI */
 
 /*
  * Status Payload (Section 10.4)
@@ -142,6 +185,15 @@ esp_err_t ble_gatt_dsp_notify_status(void);
  * @return ESP_OK on success
  */
 esp_err_t ble_gatt_dsp_notify_galactic_status(void);
+
+/*
+ * Send OTA status notification to connected client
+ * Contains 8-byte payload with OTA progress information
+ *
+ * @param status OTA status data (8 bytes)
+ * @return ESP_OK on success
+ */
+esp_err_t ble_gatt_dsp_notify_ota_status(const uint8_t *status);
 
 /*
  * Check if a BLE client is connected

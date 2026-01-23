@@ -40,6 +40,7 @@
 #include "dsp_processor.h"
 #include "ble_gatt_dsp.h"
 #include "nvs_settings.h"
+#include "ota_manager.h"
 
 static const char *TAG = "BT_SPEAKER";
 
@@ -342,6 +343,15 @@ static void settings_changed_callback(void)
 }
 
 /*
+ * Callback for OTA status updates (for BLE notifications)
+ */
+static void ota_status_callback(const ota_status_t *status)
+{
+    /* Send OTA status notification via BLE */
+    ble_gatt_dsp_notify_ota_status((const uint8_t *)status);
+}
+
+/*
  * Initialize Bluetooth stack (dual mode: Classic + BLE)
  */
 static esp_err_t bluetooth_init(void)
@@ -471,7 +481,7 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "=== ESP32 Bluetooth Speaker with DSP ===");
     ESP_LOGI(TAG, "FSD-DSP-001: DSP Presets + Loudness via BLE GATT");
-    ESP_LOGI(TAG, "Firmware version: 2.0");
+    ESP_LOGI(TAG, "Firmware version: %s", ota_mgr_get_version());
 
     /* Initialize NVS (required for Bluetooth and settings storage) */
     esp_err_t ret = nvs_flash_init();
@@ -529,12 +539,26 @@ void app_main(void)
         esp_restart();
     }
 
+    /* Initialize OTA manager */
+    ret = ota_mgr_init(ota_status_callback);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "OTA manager init failed: %s", esp_err_to_name(ret));
+        /* Non-fatal - continue without OTA support */
+    } else {
+        ESP_LOGI(TAG, "OTA manager initialized");
+        /* Check for pending firmware validation */
+        if (ota_mgr_is_pending_verify()) {
+            ESP_LOGW(TAG, "New firmware pending validation - send VALIDATE command via BLE");
+        }
+    }
+
     /* Create watchdog monitoring task */
     xTaskCreate(watchdog_task, "watchdog", 2048, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "System ready");
     ESP_LOGI(TAG, "- Classic BT: Waiting for A2DP audio connection");
     ESP_LOGI(TAG, "- BLE: DSP control service advertising");
+    ESP_LOGI(TAG, "- OTA: Hybrid BLE+WiFi updates enabled");
     ESP_LOGI(TAG, "- DSP: %s preset, loudness %s",
              dsp_preset_name(dsp_get_preset()),
              dsp_get_loudness() ? "ON" : "OFF");

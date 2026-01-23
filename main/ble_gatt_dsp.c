@@ -7,6 +7,7 @@
  */
 
 #include "ble_gatt_dsp.h"
+#include "ota_manager.h"
 #include <string.h>
 #include "esp_log.h"
 #include "esp_bt.h"
@@ -34,6 +35,16 @@ enum {
     IDX_GALACTIC_CHAR,          /* GalacticStatus characteristic declaration */
     IDX_GALACTIC_VAL,           /* GalacticStatus characteristic value */
     IDX_GALACTIC_CCC,           /* GalacticStatus Client Characteristic Configuration */
+    /* OTA characteristics */
+    IDX_OTA_CREDS_CHAR,         /* OTA Credentials characteristic declaration */
+    IDX_OTA_CREDS_VAL,          /* OTA Credentials characteristic value */
+    IDX_OTA_URL_CHAR,           /* OTA URL characteristic declaration */
+    IDX_OTA_URL_VAL,            /* OTA URL characteristic value */
+    IDX_OTA_CTRL_CHAR,          /* OTA Control characteristic declaration */
+    IDX_OTA_CTRL_VAL,           /* OTA Control characteristic value */
+    IDX_OTA_STATUS_CHAR,        /* OTA Status characteristic declaration */
+    IDX_OTA_STATUS_VAL,         /* OTA Status characteristic value */
+    IDX_OTA_STATUS_CCC,         /* OTA Status Client Characteristic Configuration */
     IDX_NB,                     /* Number of attributes */
 };
 
@@ -48,14 +59,25 @@ static const uint8_t dsp_control_uuid[16] = DSP_CONTROL_CHAR_UUID_128;
 static const uint8_t dsp_status_uuid[16] = DSP_STATUS_CHAR_UUID_128;
 static const uint8_t dsp_galactic_uuid[16] = DSP_GALACTIC_CHAR_UUID_128;
 
+/* OTA Characteristic UUIDs */
+static const uint8_t ota_creds_uuid[16] = OTA_CREDS_CHAR_UUID_128;
+static const uint8_t ota_url_uuid[16] = OTA_URL_CHAR_UUID_128;
+static const uint8_t ota_ctrl_uuid[16] = OTA_CONTROL_CHAR_UUID_128;
+static const uint8_t ota_status_uuid[16] = OTA_STATUS_CHAR_UUID_128;
+
 /* Characteristic properties */
 static const uint8_t ctrl_char_prop = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR;
 static const uint8_t status_char_prop = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
 static const uint8_t galactic_char_prop = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
 
+/* OTA Characteristic properties */
+static const uint8_t ota_write_char_prop = ESP_GATT_CHAR_PROP_BIT_WRITE;
+static const uint8_t ota_status_char_prop = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+
 /* Client Characteristic Configuration Descriptor default values */
 static uint8_t status_ccc[2] = {0x00, 0x00};
 static uint8_t galactic_ccc[2] = {0x00, 0x00};
+static uint8_t ota_status_ccc[2] = {0x00, 0x00};
 
 /* Control characteristic value (2 bytes: CMD + VAL) */
 static uint8_t ctrl_value[2] = {0x00, 0x00};
@@ -78,6 +100,12 @@ static uint8_t galactic_value[DSP_GALACTIC_STATUS_SIZE] = {
     100,                            /* Energy core (battery placeholder) */
     0                               /* lastContact (seconds) */
 };
+
+/* OTA characteristic values */
+static uint8_t ota_creds_value[OTA_CREDS_MAX_SIZE] = {0};
+static uint8_t ota_url_value[OTA_URL_MAX_SIZE] = {0};
+static uint8_t ota_ctrl_value[OTA_CONTROL_SIZE] = {0};
+static uint8_t ota_status_value[OTA_STATUS_SIZE] = {0};
 
 /* GATT attribute table */
 static const esp_gatts_attr_db_t gatt_db[IDX_NB] = {
@@ -170,6 +198,98 @@ static const esp_gatts_attr_db_t gatt_db[IDX_NB] = {
             sizeof(galactic_ccc), sizeof(galactic_ccc), galactic_ccc
         }
     },
+
+    /* ========== OTA Characteristics ========== */
+
+    /* OTA Credentials Characteristic Declaration */
+    [IDX_OTA_CREDS_CHAR] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_CHAR_DECLARE},
+            ESP_GATT_PERM_READ,
+            sizeof(uint8_t), sizeof(uint8_t), (uint8_t *)&ota_write_char_prop
+        }
+    },
+
+    /* OTA Credentials Characteristic Value */
+    [IDX_OTA_CREDS_VAL] = {
+        {ESP_GATT_RSP_BY_APP},
+        {
+            ESP_UUID_LEN_128, (uint8_t *)ota_creds_uuid,
+            ESP_GATT_PERM_WRITE,
+            sizeof(ota_creds_value), 0, ota_creds_value
+        }
+    },
+
+    /* OTA URL Characteristic Declaration */
+    [IDX_OTA_URL_CHAR] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_CHAR_DECLARE},
+            ESP_GATT_PERM_READ,
+            sizeof(uint8_t), sizeof(uint8_t), (uint8_t *)&ota_write_char_prop
+        }
+    },
+
+    /* OTA URL Characteristic Value */
+    [IDX_OTA_URL_VAL] = {
+        {ESP_GATT_RSP_BY_APP},
+        {
+            ESP_UUID_LEN_128, (uint8_t *)ota_url_uuid,
+            ESP_GATT_PERM_WRITE,
+            sizeof(ota_url_value), 0, ota_url_value
+        }
+    },
+
+    /* OTA Control Characteristic Declaration */
+    [IDX_OTA_CTRL_CHAR] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_CHAR_DECLARE},
+            ESP_GATT_PERM_READ,
+            sizeof(uint8_t), sizeof(uint8_t), (uint8_t *)&ota_write_char_prop
+        }
+    },
+
+    /* OTA Control Characteristic Value */
+    [IDX_OTA_CTRL_VAL] = {
+        {ESP_GATT_RSP_BY_APP},
+        {
+            ESP_UUID_LEN_128, (uint8_t *)ota_ctrl_uuid,
+            ESP_GATT_PERM_WRITE,
+            sizeof(ota_ctrl_value), 0, ota_ctrl_value
+        }
+    },
+
+    /* OTA Status Characteristic Declaration */
+    [IDX_OTA_STATUS_CHAR] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_CHAR_DECLARE},
+            ESP_GATT_PERM_READ,
+            sizeof(uint8_t), sizeof(uint8_t), (uint8_t *)&ota_status_char_prop
+        }
+    },
+
+    /* OTA Status Characteristic Value */
+    [IDX_OTA_STATUS_VAL] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_128, (uint8_t *)ota_status_uuid,
+            ESP_GATT_PERM_READ,
+            sizeof(ota_status_value), sizeof(ota_status_value), ota_status_value
+        }
+    },
+
+    /* OTA Status Client Characteristic Configuration Descriptor */
+    [IDX_OTA_STATUS_CCC] = {
+        {ESP_GATT_AUTO_RSP},
+        {
+            ESP_UUID_LEN_16, (uint8_t *)&(uint16_t){ESP_GATT_UUID_CHAR_CLIENT_CONFIG},
+            ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+            sizeof(ota_status_ccc), sizeof(ota_status_ccc), ota_status_ccc
+        }
+    },
 };
 
 /* Advertising data - contains service UUID and flags
@@ -225,6 +345,7 @@ typedef struct {
     bool connected;
     bool notifications_enabled;
     bool galactic_notifications_enabled;  /* CCCD for GalacticStatus (FR-18) */
+    bool ota_notifications_enabled;       /* CCCD for OTA Status */
     int64_t last_contact_us;              /* Timestamp of last BLE interaction (FR-19) */
     TimerHandle_t galactic_notify_timer;  /* FreeRTOS timer for periodic notifications (FR-20) */
     ble_dsp_settings_cb_t settings_cb;
@@ -236,6 +357,7 @@ static ble_state_t s_ble = {
     .connected = false,
     .notifications_enabled = false,
     .galactic_notifications_enabled = false,
+    .ota_notifications_enabled = false,
     .last_contact_us = 0,
     .galactic_notify_timer = NULL,
     .settings_cb = NULL,
@@ -537,6 +659,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         s_ble.connected = false;
         s_ble.notifications_enabled = false;
         s_ble.galactic_notifications_enabled = false;
+        s_ble.ota_notifications_enabled = false;
 
         /* Stop GalacticStatus notification timer (FR-20) */
         if (s_ble.galactic_notify_timer != NULL) {
@@ -578,6 +701,46 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                     s_ble.galactic_notifications_enabled = (ccc_val == 0x0001);
                     ESP_LOGI(TAG, "GalacticStatus notifications %s",
                              s_ble.galactic_notifications_enabled ? "enabled" : "disabled");
+                }
+            }
+            /* Handle write to OTA Credentials characteristic */
+            else if (param->write.handle == s_ble.handle_table[IDX_OTA_CREDS_VAL]) {
+                ESP_LOGI(TAG, "OTA credentials received, len=%d", param->write.len);
+                ota_mgr_set_credentials(param->write.value, param->write.len);
+                if (param->write.need_rsp) {
+                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
+                                               param->write.trans_id, ESP_GATT_OK, NULL);
+                }
+            }
+            /* Handle write to OTA URL characteristic */
+            else if (param->write.handle == s_ble.handle_table[IDX_OTA_URL_VAL]) {
+                ESP_LOGI(TAG, "OTA URL received, len=%d", param->write.len);
+                ota_mgr_set_url(param->write.value, param->write.len);
+                if (param->write.need_rsp) {
+                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
+                                               param->write.trans_id, ESP_GATT_OK, NULL);
+                }
+            }
+            /* Handle write to OTA Control characteristic */
+            else if (param->write.handle == s_ble.handle_table[IDX_OTA_CTRL_VAL]) {
+                if (param->write.len >= 1) {
+                    uint8_t cmd = param->write.value[0];
+                    uint8_t val = (param->write.len >= 2) ? param->write.value[1] : 0;
+                    ESP_LOGI(TAG, "OTA command: CMD=0x%02X, VAL=0x%02X", cmd, val);
+                    ota_mgr_execute_command(cmd, val);
+                }
+                if (param->write.need_rsp) {
+                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
+                                               param->write.trans_id, ESP_GATT_OK, NULL);
+                }
+            }
+            /* Handle write to OTA Status CCC (enable/disable notifications) */
+            else if (param->write.handle == s_ble.handle_table[IDX_OTA_STATUS_CCC]) {
+                if (param->write.len == 2) {
+                    uint16_t ccc_val = param->write.value[0] | (param->write.value[1] << 8);
+                    s_ble.ota_notifications_enabled = (ccc_val == 0x0001);
+                    ESP_LOGI(TAG, "OTA Status notifications %s",
+                             s_ble.ota_notifications_enabled ? "enabled" : "disabled");
                 }
             }
         }
@@ -724,4 +887,37 @@ bool ble_gatt_dsp_is_connected(void)
 uint16_t ble_gatt_dsp_get_conn_handle(void)
 {
     return s_ble.conn_id;
+}
+
+esp_err_t ble_gatt_dsp_notify_ota_status(const uint8_t *status)
+{
+    if (!s_ble.connected || !s_ble.ota_notifications_enabled) {
+        return ESP_OK;  /* Not an error, just nothing to do */
+    }
+
+    if (status == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Copy status to local value */
+    memcpy(ota_status_value, status, OTA_STATUS_SIZE);
+
+    /* Update the attribute value in GATT database */
+    if (s_ble.gatts_if != ESP_GATT_IF_NONE && s_ble.handle_table[IDX_OTA_STATUS_VAL] != 0) {
+        esp_ble_gatts_set_attr_value(s_ble.handle_table[IDX_OTA_STATUS_VAL],
+                                     OTA_STATUS_SIZE, ota_status_value);
+    }
+
+    /* Send notification */
+    esp_err_t ret = esp_ble_gatts_send_indicate(s_ble.gatts_if, s_ble.conn_id,
+                                                 s_ble.handle_table[IDX_OTA_STATUS_VAL],
+                                                 OTA_STATUS_SIZE, ota_status_value, false);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "OTA status notification failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGD(TAG, "OTA status notification sent: state=%d, progress=%d%%",
+                 status[0], status[2]);
+    }
+
+    return ret;
 }
