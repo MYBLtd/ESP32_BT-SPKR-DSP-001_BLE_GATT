@@ -4,8 +4,8 @@
 
 ## Version
 **Document ID:** FSD-DSP-001
-**Status:** Release (v1.1)
-**Date:** 2026-01-22
+**Status:** Release (v2.0)
+**Date:** 2026-01-23
 **GIT Origin:** https://github.com/MYBLtd/ESP32_BT-SPKR-DSP-001_BLE_GATT.git
 
 ## Author
@@ -18,6 +18,8 @@ Robin Kluit
 |---------|------------|--------------------------------------------------|
 | v1.0    | 2026-01-21 | Initial release with presets and loudness        |
 | v1.1    | 2026-01-22 | Added Mute, Audio Duck, Normalizer; fixed lastContact |
+| v1.2    | 2026-01-22 | Added Volume Control (device trim)               |
+| v2.0    | 2026-01-23 | Document review and alignment with firmware 2.0  |
 
 ## 1. Purpose and Scope
 
@@ -42,7 +44,7 @@ The system offers a headless user interface (no buttons/GUI on the speaker) that
 
 Audio is streamed via Bluetooth Classic A2DP. Control is via BLE GATT. A dedicated companion app is not required: control is possible with generic BLE apps (nRF Connect/LightBlue) or the 42 Decibels iOS app.
 
-### 2.2 Scope (v1.1)
+### 2.2 Scope (v2.0)
 
 **In scope:**
 - DSP preset engine: fixed EQ-curves per preset
@@ -50,6 +52,7 @@ Audio is streamed via Bluetooth Classic A2DP. Control is via BLE GATT. A dedicat
 - Mute function with smooth fade
 - Audio Duck (panic button) with ~25% volume reduction
 - Normalizer (dynamic range compression)
+- Volume Control (device trim) with preset-based caps
 - Protection chain: high-pass + limiter
 - BLE GATT control plane (write + status notify)
 - Persistent storage of settings
@@ -58,7 +61,7 @@ Audio is streamed via Bluetooth Classic A2DP. Control is via BLE GATT. A dedicat
 **Out of scope**
 - Room calibration / microphone-measuring
 - Wi-Fi SoftAP UI
-- OTA updates (planned for v1.2)
+- OTA updates (planned for future version)
 
 ### 2.3 Design-principles
 
@@ -213,12 +216,24 @@ Normalizer (Dynamic Range Compression):
 - Perfect for late-night viewing or noisy environments.
 - Normalizer state is reported in shieldStatus bit 3.
 
+**FR-24**
+Volume Control (Device Trim):
+
+- Command 0x07 sets the volume trim level (0-100).
+- Volume is applied with smooth gain transition (no clicks).
+- Actual volume may be capped based on preset (NIGHT: max 60%).
+- When Normalizer is enabled, volume cap is further reduced for headroom.
+- Effective volume is reported in GalacticStatus byte 4.
+- Volume mapping: 100=0dB, 80=-6dB, 60=-12dB, 40=-20dB, 20=-35dB, 0=mute.
+- Details for implementation are in chapter 10 of this document.
+ 
+
 ## 4 DSP Architecture
 
-### 4.1 Signal chain (v1.1)
+### 4.1 Signal chain (v2.0)
 
 ```
-Input -> Pre-gain (-6dB) -> HPF -> Preset EQ -> Loudness EQ -> Normalizer -> Limiter -> Audio Duck -> Mute -> Output
+Input -> Pre-gain (-6dB) -> HPF -> Preset EQ -> Loudness EQ -> Normalizer -> Limiter -> Volume Trim -> Audio Duck -> Mute -> Output
 ```
 
 Components:
@@ -228,8 +243,9 @@ Components:
 4. **Loudness overlay EQ**: Optional bass/treble boost (2 bands)
 5. **Normalizer**: Optional dynamic range compression
 6. **Limiter**: Output protection against clipping
-7. **Audio Duck**: Optional volume reduction (-12 dB)
-8. **Mute**: Final output gate
+7. **Volume Trim**: Device-side volume control (0-100, capped by preset)
+8. **Audio Duck**: Optional volume reduction (-12 dB)
+9. **Mute**: Final output gate
 
 ### 4.2 Filter type
 
@@ -320,13 +336,74 @@ When Loudness is ON, an extra EQ overlay is applied on top of the preset.
 - Loudness must not make "FULL + Loudness" extremely boomy; overlay is intentionally mild.
 - Implementation must apply parameter smoothing when toggling.
 
-## 10. BLE GATT Interface
 
-### 10.1 Goal
+## 10 Volume Control
+
+### 10.0 Semantics
+To distinquish between the iOS volume setting and the BT speaker actual Volume we call the BT speaker actual volume setting 'Device Trim' and the iOS volume setting 'Phone Volume' .
+
+### 10.1
+Functional description:
+• User-facing volume = iPhone volume buttons / Control Center (always, even when locked).
+• Device-side gain = automatic and invisible (for caps, headroom, duck, protection).
+
+So the user experiences: “volume always works normally,” while we keep the speaker sounding safe and beautiful underwater.
+
+What does the app do with “volume”?
+
+We don't necessarily need to have a slider in the app. Better:
+• In Detailed Status, we only show:
+• System Volume: 38%
+•    Profile Cap: Night max 60% (only if relevant)
+•    If applicable a message, for instance “Safe headroom active”
+
+### 10.2
+Control logic:
+• User controls volume with iPhone buttons
+• ESP provides VOLUME trim for night cap/headroom/protection
+• App can display this (and optionally adjust it)
+
+### 10.3
+control Flow:
+1. App writes 0x07 xx (Write Without Response is fine for volume)
+2. ESP applies smooth gain
+3. Within max 500 ms, the app sees the new volume in GalacticStatus byte 4
+
+### 10.4
+The ESP handles Night / Normalizer as follows:
+Profile automatically determines the cap (mostly “set & forget”)
+• OFFICE/FULL/SPEECH: cap = 100
+• NIGHT: cap = e.g. 60 (or whatever you like)
+• Normalizer ON: ESP reserves headroom by temporarily lowering the cap (e.g. −6 dB equivalent) or via limiter.
+
+Then the user never has to adjust the volume in the app.
+
+### 10.5
+Because “0–100” often feels strange to people, we put the mapping to dB in the protocol doc (only as an implementation guideline), e.g.:
+•    100 → 0 dB
+•    80 → −6 dB
+•    60 → −12 dB
+•    40 → −20 dB
+•    20 → −35 dB
+•    0 → mute-ish
+
+### 10.6
+command type:
+	•	Set Volume Trim: 0x07
+	•	Byte 1: 0x00–0x64 (= 0–100)
+
+Example:
+	•	0x07 0x64 → trim = 100%
+	•	0x07 0x3C → trim = 60%
+
+
+## 11. BLE GATT Interface
+
+### 11.1 Goal
 
 A generic BLE app must be able to write presets/loudness and read status.
 
-### 10.2 Services & Characteristics
+### 11.2 Services & Characteristics
 
 **Service UUID:** `00000001-1234-5678-9ABC-DEF012345678`
 
@@ -340,18 +417,19 @@ The service UUID is included in BLE advertising packets for service discovery.
 | STATUS_NOTIFY    | `00000003-1234-5678-9ABC-DEF012345678` | Read, Notify             | 4 bytes |
 | GALACTIC_STATUS  | `00000004-1234-5678-9ABC-DEF012345678` | Read, Notify             | 7 bytes |
 
-### 10.3 Control Protocol (2-byte commands)
+### 11.3 Control Protocol (2-byte commands)
 
 Format: **[CMD (1 byte)] [VAL (1 byte)]**
 
-| CMD  | Name           | VAL  | Meaning                              |
-|-----:|----------------|-----:|--------------------------------------|
-| 0x01 | SET_PRESET     | 0..3 | 0=OFFICE, 1=FULL, 2=NIGHT, 3=SPEECH  |
-| 0x02 | SET_LOUDNESS   |  0/1 | 0=OFF, 1=ON                          |
-| 0x03 | GET_STATUS     |    0 | Triggers immediate notify            |
-| 0x04 | SET_MUTE       |  0/1 | 0=Unmute, 1=Mute                     |
-| 0x05 | SET_AUDIO_DUCK |  0/1 | 0=OFF, 1=ON (reduces volume to ~25%) |
-| 0x06 | SET_NORMALIZER |  0/1 | 0=OFF, 1=ON (enables DRC)            |
+| CMD  | Name           | VAL    | Meaning                              |
+|-----:|----------------|-------:|--------------------------------------|
+| 0x01 | SET_PRESET     | 0..3   | 0=OFFICE, 1=FULL, 2=NIGHT, 3=SPEECH  |
+| 0x02 | SET_LOUDNESS   |  0/1   | 0=OFF, 1=ON                          |
+| 0x03 | GET_STATUS     |    0   | Triggers immediate notify            |
+| 0x04 | SET_MUTE       |  0/1   | 0=Unmute, 1=Mute                     |
+| 0x05 | SET_AUDIO_DUCK |  0/1   | 0=OFF, 1=ON (reduces volume to ~25%) |
+| 0x06 | SET_NORMALIZER |  0/1   | 0=OFF, 1=ON (enables DRC)            |
+| 0x07 | SET_VOLUME     | 0..100 | Volume trim (0=mute, 100=full)       |
 
 Behavior:
 
@@ -359,7 +437,7 @@ Behavior:
 - STATUS_NOTIFY sends (notify) the current state after each change.
 - GalacticStatus is updated and notified after each command.
 
-### 10.4 Status Payload (4 bytes)
+### 11.4 Status Payload (4 bytes)
 
 Format: **[VER][PRESET][LOUDNESS][FLAGS]**
 
@@ -379,7 +457,7 @@ FLAGS bitfield:
 - bit5: normalizer active
 - bit6-7: reserved (0)
 
-### 10.5 GalacticStatus Payload (7 bytes)
+### 11.5 GalacticStatus Payload (7 bytes)
 
 Format: **[VER][PRESET][FLAGS][ENERGY][VOLUME][BATTERY][LAST_CONTACT]**
 
@@ -389,7 +467,7 @@ Format: **[VER][PRESET][FLAGS][ENERGY][VOLUME][BATTERY][LAST_CONTACT]**
 | 1    | PRESET       | 0-3     | Current preset (QuantumFlavor)        |
 | 2    | FLAGS        | bitfield| Shield status flags                   |
 | 3    | ENERGY       | 0-100   | Energy core level (reserved)          |
-| 4    | VOLUME       | 0-100   | Distortion field strength (reserved)  |
+| 4    | VOLUME       | 0-100   | Effective volume level (FR-24)        |
 | 5    | BATTERY      | 0-100   | Energy core/battery (reserved)        |
 | 6    | LAST_CONTACT | 0-255   | Seconds since last BLE communication  |
 
@@ -405,11 +483,11 @@ Format: **[VER][PRESET][FLAGS][ENERGY][VOLUME][BATTERY][LAST_CONTACT]**
 
 This characteristic is automatically notified every 500ms (FR-20) when notifications are enabled.
 
-### 10.6 BLE Advertising Configuration
+### 11.6 BLE Advertising Configuration
 
 | Parameter        | Value           | Description                        |
 |------------------|-----------------|------------------------------------|
-| Device Name      | "ESP32 Speaker" | Advertised BLE device name         |
+| Device Name      | "42 Decibels"   | Advertised BLE device name         |
 | Adv Interval Min | 20ms (0x20)     | Minimum advertising interval       |
 | Adv Interval Max | 40ms (0x40)     | Maximum advertising interval       |
 | Appearance       | 0x0841          | BLE Speaker appearance             |
@@ -417,7 +495,7 @@ This characteristic is automatically notified every 500ms (FR-20) when notificat
 
 The advertising packet contains the service UUID for filtering/discovery. The scan response contains the device name and TX power.
 
-### 10.7 Connection Parameters
+### 11.7 Connection Parameters
 
 On connection, the following parameters are requested to optimize latency (FR-14):
 
@@ -428,9 +506,9 @@ On connection, the following parameters are requested to optimize latency (FR-14
 | Latency      | 0       | Slave latency (no skipped events) |
 | Timeout      | 4000ms  | Supervision timeout               |
 
-## 11. State Machine and Error Handling
+## 12. State Machine and Error Handling
 
-### 11.1 BLE connect/disconnect
+### 12.1 BLE connect/disconnect
 
 - On BLE connect:
   - Connection parameters are updated for low latency (FR-14)
@@ -444,33 +522,33 @@ On connection, the following parameters are requested to optimize latency (FR-14
   - Advertising is automatically restarted
 - On reboot: settings are loaded from NVS; status notify on first connect (read/notify).
 
-### 11.2 Unknown command / value
+### 12.2 Unknown command / value
 
 - Unknown CMD: ignore; send status back unchanged.
 - VAL out of range: v1 recommendation: ignore and notify status.
 
-## 12. Persistency
+## 13. Persistency
 
-### 12.1 Fields to store
+### 13.1 Fields to store
 
 - preset_id (uint8)
 - loudness (uint8)
 - (optional) bass_level, treble_level
 - config_version (uint8)
 
-### 12.2 Write policy
+### 13.2 Write policy
 
 - Do not flash on every BLE write.
 - Debounce: write after **1-2 seconds** without new changes.
 
-## 13. Performance and Real-time Requirements
+## 14. Performance and Real-time Requirements
 
-### 13.1 Audio task priority
+### 14.1 Audio task priority
 
 - Audio pipeline tasks have highest priority.
 - BLE handling must never run in the audio callback.
 
-### 13.2 Parameter smoothing
+### 14.2 Parameter smoothing
 
 - On preset change: crossfade/parameter ramp (**20-50 ms**) to prevent clicks.
 - Filter coefficient updates: switch in one go with output ramp, or interpolate per block.

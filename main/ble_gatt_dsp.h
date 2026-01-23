@@ -68,6 +68,7 @@ extern "C" {
 #define DSP_CMD_SET_MUTE        0x04    /* VAL: 0/1 (unmute/mute) */
 #define DSP_CMD_SET_AUDIO_DUCK  0x05    /* VAL: 0/1 (off/on) - FR-21: reduces volume to ~25% */
 #define DSP_CMD_SET_NORMALIZER  0x06    /* VAL: 0/1 (off/on) - FR-22: dynamic range compression */
+#define DSP_CMD_SET_VOLUME      0x07    /* VAL: 0-100 (volume trim) - FR-24: device volume control */
 
 /*
  * Status Payload (Section 10.4)
@@ -81,9 +82,9 @@ extern "C" {
  * Format: [VER][PRESET][FLAGS][ENERGY][VOLUME][BATTERY][LAST_CONTACT]
  * Byte 0: Protocol version (0x42)
  * Byte 1: currentQuantumFlavor (preset 0-3)
- * Byte 2: shieldStatus (flags: mute, panic, loudness, limiter)
+ * Byte 2: shieldStatus (flags: mute, audio duck, loudness, normalizer)
  * Byte 3: energyCoreLevel (0-100, placeholder)
- * Byte 4: distortionFieldStrength (volume 0-100, placeholder)
+ * Byte 4: distortionFieldStrength (volume 0-100)
  * Byte 5: Energy core (battery 0-100, placeholder)
  * Byte 6: lastContact (seconds since last BLE interaction, 0-255)
  */
@@ -93,7 +94,7 @@ extern "C" {
 /*
  * BLE advertising configuration
  */
-#define BLE_DEVICE_NAME         "ESP32 Speaker"
+#define BLE_DEVICE_NAME         "42 Decibels"
 #define BLE_ADV_INTERVAL_MIN    0x20    /* 20ms */
 #define BLE_ADV_INTERVAL_MAX    0x40    /* 40ms */
 

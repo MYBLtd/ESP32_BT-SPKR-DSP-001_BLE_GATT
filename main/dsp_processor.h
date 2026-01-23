@@ -51,8 +51,8 @@ typedef struct {
 #define DSP_FLAG_CLIPPING         (1 << 1)
 #define DSP_FLAG_THERMAL_WARN     (1 << 2)
 #define DSP_FLAG_MUTED            (1 << 3)
-#define DSP_FLAG_AUDIO_DUCK       (1 << 4)  /* FR-21: Audio duck (panic) active */
-#define DSP_FLAG_NORMALIZER       (1 << 5)  /* FR-22: Normalizer/DRC active */
+#define DSP_FLAG_AUDIO_DUCK       (1 << 4)  /* FR-22: Audio duck (panic) active */
+#define DSP_FLAG_NORMALIZER       (1 << 5)  /* FR-23: Normalizer/DRC active */
 
 /*
  * Biquad filter coefficients
@@ -109,6 +109,11 @@ typedef struct {
 
 /* Audio Duck settings (FR-21) */
 #define DSP_AUDIO_DUCK_GAIN_DB  (-12.0f) /* ~25% volume reduction */
+
+/* Volume Trim settings (FR-24) */
+#define DSP_VOLUME_TRIM_DEFAULT  100     /* Default volume: 100% */
+#define DSP_VOLUME_CAP_NIGHT     60      /* Night preset cap: 60% */
+#define DSP_VOLUME_CAP_NORMALIZER_REDUCTION 20  /* Reduce cap by ~20% when normalizer on */
 
 /* Normalizer/DRC settings (FR-22) */
 #define DSP_NORMALIZER_THRESHOLD_DB (-20.0f)
@@ -215,6 +220,39 @@ esp_err_t dsp_set_normalizer(bool enabled);
  * @return true if normalizer is enabled
  */
 bool dsp_get_normalizer(void);
+
+/*
+ * Set volume trim (FR-24)
+ * Sets the device-side volume level (0-100)
+ * The actual volume may be capped based on preset and normalizer state.
+ *
+ * @param value Volume trim value (0-100)
+ * @return ESP_OK on success
+ */
+esp_err_t dsp_set_volume_trim(uint8_t value);
+
+/*
+ * Get volume trim (FR-24)
+ *
+ * @return Current volume trim setting (0-100)
+ */
+uint8_t dsp_get_volume_trim(void);
+
+/*
+ * Get effective volume (FR-24)
+ * Returns the actual volume after applying preset/normalizer caps
+ *
+ * @return Effective volume (0-100)
+ */
+uint8_t dsp_get_effective_volume(void);
+
+/*
+ * Get volume cap (FR-24)
+ * Returns the current maximum volume allowed based on preset/normalizer
+ *
+ * @return Volume cap (0-100)
+ */
+uint8_t dsp_get_volume_cap(void);
 
 /*
  * Get DSP status for BLE notification
