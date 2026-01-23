@@ -4,7 +4,7 @@
 
 ## Version
 **Document ID:** FSD-DSP-001
-**Status:** Release (v2.0)
+**Status:** Release (v2.1)
 **Date:** 2026-01-23
 **GIT Origin:** https://github.com/MYBLtd/ESP32_BT-SPKR-DSP-001_BLE_GATT.git
 
@@ -20,6 +20,7 @@ Robin Kluit
 | v1.1    | 2026-01-22 | Added Mute, Audio Duck, Normalizer; fixed lastContact |
 | v1.2    | 2026-01-22 | Added Volume Control (device trim)               |
 | v2.0    | 2026-01-23 | Document review and alignment with firmware 2.0  |
+| v2.1    | 2026-01-23 | Added OTA firmware update support (BLE+WiFi)     |
 
 ## 1. Purpose and Scope
 
@@ -44,7 +45,7 @@ The system offers a headless user interface (no buttons/GUI on the speaker) that
 
 Audio is streamed via Bluetooth Classic A2DP. Control is via BLE GATT. A dedicated companion app is not required: control is possible with generic BLE apps (nRF Connect/LightBlue) or the 42 Decibels iOS app.
 
-### 2.2 Scope (v2.0)
+### 2.2 Scope (v2.1)
 
 **In scope:**
 - DSP preset engine: fixed EQ-curves per preset
@@ -57,11 +58,11 @@ Audio is streamed via Bluetooth Classic A2DP. Control is via BLE GATT. A dedicat
 - BLE GATT control plane (write + status notify)
 - Persistent storage of settings
 - GalacticStatus extended status reporting
+- OTA firmware updates via BLE provisioning + WiFi download
 
 **Out of scope**
 - Room calibration / microphone-measuring
-- Wi-Fi SoftAP UI
-- OTA updates (planned for future version)
+- Wi-Fi SoftAP UI for general configuration
 
 ### 2.3 Design-principles
 
@@ -226,7 +227,25 @@ Volume Control (Device Trim):
 - Effective volume is reported in GalacticStatus byte 4.
 - Volume mapping: 100=0dB, 80=-6dB, 60=-12dB, 40=-20dB, 20=-35dB, 0=mute.
 - Details for implementation are in chapter 10 of this document.
- 
+
+**FR-25**
+OTA Firmware Updates (Hybrid BLE+WiFi):
+
+- WiFi credentials are provisioned via BLE characteristic 0x0005.
+- Firmware URL is provisioned via BLE characteristic 0x0006.
+- OTA control commands are sent via BLE characteristic 0x0007.
+- OTA progress is reported via BLE characteristic 0x0008 (8-byte status).
+- OTA process:
+  1. App writes WiFi SSID/password to OTA Credentials characteristic
+  2. App writes firmware URL to OTA URL characteristic
+  3. App sends START command (0x10) to OTA Control characteristic
+  4. Device connects to WiFi, downloads firmware, reports progress
+  5. On success, app sends REBOOT command (0x12)
+  6. After reboot, app sends VALIDATE command (0x15) to prevent rollback
+- Rollback support: device can revert to previous firmware if validation fails.
+- WiFi is only active during OTA; disconnects after update completes.
+- Details for implementation are in chapter 15 of this document.
+
 
 ## 4 DSP Architecture
 
@@ -409,13 +428,22 @@ A generic BLE app must be able to write presets/loudness and read status.
 
 The service UUID is included in BLE advertising packets for service discovery.
 
-**Characteristics:**
+**DSP Control Characteristics:**
 
 | Characteristic   | UUID                                   | Properties               | Size    |
 |------------------|----------------------------------------|--------------------------|---------|
 | CONTROL_WRITE    | `00000002-1234-5678-9ABC-DEF012345678` | Write, Write No Response | 2 bytes |
 | STATUS_NOTIFY    | `00000003-1234-5678-9ABC-DEF012345678` | Read, Notify             | 4 bytes |
 | GALACTIC_STATUS  | `00000004-1234-5678-9ABC-DEF012345678` | Read, Notify             | 7 bytes |
+
+**OTA Characteristics:**
+
+| Characteristic   | UUID                                   | Properties  | Size      |
+|------------------|----------------------------------------|-------------|-----------|
+| OTA_CREDENTIALS  | `00000005-1234-5678-9ABC-DEF012345678` | Write       | 98 bytes  |
+| OTA_URL          | `00000006-1234-5678-9ABC-DEF012345678` | Write       | 258 bytes |
+| OTA_CONTROL      | `00000007-1234-5678-9ABC-DEF012345678` | Write       | 2 bytes   |
+| OTA_STATUS       | `00000008-1234-5678-9ABC-DEF012345678` | Read, Notify| 8 bytes   |
 
 ### 11.3 Control Protocol (2-byte commands)
 
@@ -553,3 +581,135 @@ On connection, the following parameters are requested to optimize latency (FR-14
 - On preset change: crossfade/parameter ramp (**20-50 ms**) to prevent clicks.
 - Filter coefficient updates: switch in one go with output ramp, or interpolate per block.
 - Mute, Audio Duck, and Normalizer use smooth gain transitions.
+
+## 15. OTA Firmware Updates
+
+### 15.1 Architecture
+
+The OTA system uses a hybrid BLE + WiFi approach:
+- **BLE**: Used for provisioning (credentials, URL) and control commands
+- **WiFi**: Used only for firmware download (temporary connection)
+
+This approach allows OTA updates without requiring a permanent WiFi configuration UI.
+
+### 15.2 OTA Characteristics
+
+#### OTA Credentials (0x0005)
+- **Format**: `SSID\0PASSWORD` (null-separated)
+- **Max Size**: 98 bytes (32 SSID + 1 separator + 64 password + 1 padding)
+- Credentials are stored in memory only (not persisted)
+
+#### OTA URL (0x0006)
+- **Format**: URL string (null-terminated or length-prefixed)
+- **Max Size**: 258 bytes (2 length + 256 URL)
+- Supports HTTP and HTTPS URLs
+
+#### OTA Control (0x0007)
+- **Format**: `[CMD][PARAM]` (2 bytes)
+- Commands:
+  - `0x10`: START - Begin OTA process
+  - `0x11`: CANCEL - Abort OTA operation
+  - `0x12`: REBOOT - Reboot to new firmware
+  - `0x13`: GET_VERSION - Query firmware version
+  - `0x14`: ROLLBACK - Revert to previous firmware
+  - `0x15`: VALIDATE - Mark firmware as valid
+
+#### OTA Status (0x0008)
+- **Format**: 8-byte status packet (see Protocol.md)
+- Notifications sent automatically during OTA operations
+- Contains: state, error code, progress %, downloaded/total KB, WiFi RSSI
+
+### 15.3 OTA State Machine
+
+```
+IDLE ──(credentials)──> CREDS_RECEIVED
+  │                            │
+  │                    (url)───┘
+  │                            │
+  │                            v
+  │                     URL_RECEIVED
+  │                            │
+  │                    (start)─┘
+  │                            │
+  │                            v
+  │                  WIFI_CONNECTING
+  │                            │
+  │                    (connected)
+  │                            │
+  │                            v
+  │                   WIFI_CONNECTED
+  │                            │
+  │                    (download)
+  │                            │
+  │                            v
+  │                    DOWNLOADING ──(progress)──> DOWNLOADING
+  │                            │
+  │                    (complete)
+  │                            │
+  │                            v
+  │                     VERIFYING
+  │                            │
+  │                    (verified)
+  │                            │
+  │                            v
+  │                      SUCCESS
+  │                            │
+  │                    (reboot)─┘
+  │                            │
+  │                            v
+  │                   [Device Reboots]
+  │                            │
+  │                            v
+  │                  PENDING_VERIFY
+  │                            │
+  │                   (validate)
+  │                            │
+  │                            v
+  └─────────────────────────> IDLE
+
+Any State ──(error)──> ERROR
+Any State ──(cancel)──> IDLE
+```
+
+### 15.4 Error Handling
+
+| Error Code | Description | Recovery |
+|------------|-------------|----------|
+| 0x01 | WiFi connection failed | Check credentials, retry |
+| 0x02 | HTTP connection failed | Check URL, network |
+| 0x03 | HTTP error response | Check server/URL |
+| 0x04 | Download failed | Check network, retry |
+| 0x05 | Verification failed | Re-download |
+| 0x06 | Flash write failed | Critical - check storage |
+| 0x07 | No credentials | Write credentials first |
+| 0x08 | No URL | Write URL first |
+| 0x09 | Invalid firmware | Check firmware file |
+| 0x0A | Cancelled | User cancelled |
+| 0x0B | Rollback failed | Critical error |
+
+### 15.5 Partition Table
+
+OTA requires a dual-partition scheme (`partitions_ota.csv`):
+
+| Name | Type | SubType | Offset | Size |
+|------|------|---------|--------|------|
+| nvs | data | nvs | 0x9000 | 0x6000 |
+| phy_init | data | phy | 0xf000 | 0x1000 |
+| factory | app | factory | 0x10000 | 1M |
+| ota_0 | app | ota_0 | 0x110000 | 1M |
+| ota_1 | app | ota_1 | 0x210000 | 1M |
+| ota_data | data | ota | 0x310000 | 0x2000 |
+
+### 15.6 Rollback Protection
+
+- After booting new firmware, the device enters `PENDING_VERIFY` state
+- App must send VALIDATE command (0x15) to mark firmware as valid
+- If not validated within timeout, device may auto-rollback on next boot
+- Manual rollback available via ROLLBACK command (0x14)
+
+### 15.7 WiFi Behavior
+
+- WiFi is initialized only when OTA START command is received
+- WiFi disconnects automatically after OTA completes (success or error)
+- WiFi does not interfere with A2DP audio during normal operation
+- WiFi RSSI is reported in OTA Status for signal quality monitoring

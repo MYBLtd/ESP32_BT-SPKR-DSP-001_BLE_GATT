@@ -2,7 +2,7 @@
 
 A Bluetooth audio receiver with real-time DSP processing and BLE GATT control interface for ESP32.
 
-**Version:** 1.2 | **Date:** 2026-01-22
+**Version:** 2.1 | **Date:** 2026-01-23
 
 ## Features
 
@@ -12,6 +12,7 @@ A Bluetooth audio receiver with real-time DSP processing and BLE GATT control in
 - **Mute & Audio Duck** - Instant mute and panic button for quick volume reduction
 - **Normalizer (DRC)** - Dynamic range compression for late-night listening
 - **Volume Control** - Device-side volume trim with preset-based caps
+- **OTA Firmware Updates** - Over-the-air updates via BLE provisioning + WiFi download
 - **GalacticStatus** - Extended status reporting with periodic notifications (2x/sec)
 - **Persistent Settings** - Settings survive power cycles via NVS flash storage
 - **iOS Compatible** - Secure Simple Pairing (SSP) for seamless iOS pairing
@@ -97,6 +98,10 @@ DSP Control Service: 00000001-1234-5678-9ABC-DEF012345678
 | Control Write | `00000002-1234-5678-9ABC-DEF012345678` | Write, Write Without Response | 2 bytes |
 | Status Notify | `00000003-1234-5678-9ABC-DEF012345678` | Read, Notify | 4 bytes |
 | GalacticStatus | `00000004-1234-5678-9ABC-DEF012345678` | Read, Notify | 7 bytes |
+| OTA Credentials | `00000005-1234-5678-9ABC-DEF012345678` | Write | 98 bytes |
+| OTA URL | `00000006-1234-5678-9ABC-DEF012345678` | Write | 258 bytes |
+| OTA Control | `00000007-1234-5678-9ABC-DEF012345678` | Write | 2 bytes |
+| OTA Status | `00000008-1234-5678-9ABC-DEF012345678` | Read, Notify | 8 bytes |
 
 ### Command Format
 
@@ -181,6 +186,30 @@ Format: `[VER] [PRESET] [FLAGS] [ENERGY] [VOLUME] [BATTERY] [LAST_CONTACT]`
 0700  - Set volume to 0% (mute)
 ```
 
+### OTA Commands (Write to OTA Control characteristic)
+
+| CMD | Name | Description |
+|-----|------|-------------|
+| `0x10` | START | Start OTA download process |
+| `0x11` | CANCEL | Cancel active OTA |
+| `0x12` | REBOOT | Reboot to new firmware |
+| `0x13` | GET_VERSION | Get current firmware version |
+| `0x14` | ROLLBACK | Rollback to previous firmware |
+| `0x15` | VALIDATE | Mark new firmware as valid |
+
+### OTA Status Format (8 bytes)
+
+Format: `[STATE] [ERROR] [PROGRESS] [DL_KB_L] [DL_KB_H] [TOTAL_KB_L] [TOTAL_KB_H] [RSSI]`
+
+| Byte | Field | Description |
+|------|-------|-------------|
+| 0 | STATE | OTA state (0x00=Idle, 0x05=Downloading, 0x07=Success, 0xFF=Error) |
+| 1 | ERROR | Error code (0=none, see Protocol.md) |
+| 2 | PROGRESS | Download progress 0-100% |
+| 3-4 | DOWNLOADED_KB | Bytes downloaded (little-endian KB) |
+| 5-6 | TOTAL_KB | Total firmware size (little-endian KB) |
+| 7 | RSSI | WiFi signal strength (signed dBm)
+
 ## DSP Architecture
 
 ### Signal Chain
@@ -246,7 +275,9 @@ Input → Pre-gain (-6dB) → HPF (95Hz) → Preset EQ → Loudness EQ → Norma
 ```
 ├── CMakeLists.txt
 ├── README.md
+├── Protocol.md                      # BLE Protocol Documentation
 ├── FSD-DSP-001_ESP32_BLE_GATT.md    # Functional Specification Document
+├── partitions_ota.csv               # OTA partition table
 ├── sdkconfig.defaults
 └── main/
     ├── CMakeLists.txt
@@ -256,7 +287,11 @@ Input → Pre-gain (-6dB) → HPF (95Hz) → Preset EQ → Loudness EQ → Norma
     ├── ble_gatt_dsp.h               # BLE GATT service API
     ├── ble_gatt_dsp.c               # BLE GATT implementation
     ├── nvs_settings.h               # Persistent storage API
-    └── nvs_settings.c               # NVS implementation with debouncing
+    ├── nvs_settings.c               # NVS implementation with debouncing
+    ├── ota_manager.h                # OTA update manager API
+    ├── ota_manager.c                # OTA state machine and download logic
+    ├── wifi_manager.h               # WiFi connection manager API
+    └── wifi_manager.c               # WiFi STA mode for OTA downloads
 ```
 
 ## Configuration
@@ -284,7 +319,7 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 - **EQ Curves**: Edit `preset_params` array in `dsp_processor.c`
 - **Limiter Settings**: Adjust `DSP_LIMITER_*` defines in `dsp_processor.h`
 
-## Functional Requirements (FSD-DSP-001 v1.2)
+## Functional Requirements (FSD-DSP-001 v2.1)
 
 | ID | Requirement | Status |
 |----|-------------|--------|
@@ -310,6 +345,7 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 | FR-22 | Audio Duck (panic button, -12 dB) | ✅ |
 | FR-23 | Normalizer (dynamic range compression) | ✅ |
 | FR-24 | Volume Control (device trim with caps) | ✅ |
+| FR-25 | OTA firmware updates (BLE+WiFi hybrid) | ✅ |
 
 ## License
 
