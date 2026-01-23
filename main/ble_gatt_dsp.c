@@ -346,6 +346,13 @@ static void handle_control_write(const uint8_t *data, uint16_t len)
         ESP_LOGI(TAG, "Normalizer set to: %s", val ? "ON" : "OFF");
         break;
 
+    case DSP_CMD_SET_VOLUME:
+        /* FR-24: Volume trim (0-100) */
+        dsp_set_volume_trim(val);
+        settings_changed = true;
+        ESP_LOGI(TAG, "Volume set to: %d%% (effective: %d%%)", val, dsp_get_effective_volume());
+        break;
+
     default:
         ESP_LOGW(TAG, "Unknown command: 0x%02X", cmd);
         break;
@@ -421,7 +428,7 @@ static void update_galactic_status_value(void)
     galactic_value[1] = dsp_status.preset;              /* currentQuantumFlavor */
     galactic_value[2] = shield_status;                  /* shieldStatus */
     galactic_value[3] = 100;                            /* energyCoreLevel (placeholder) */
-    galactic_value[4] = 50;                             /* distortionFieldStrength (placeholder) */
+    galactic_value[4] = dsp_get_effective_volume();     /* distortionFieldStrength (FR-24: actual volume) */
     galactic_value[5] = 100;                            /* Energy core/battery (placeholder) */
     galactic_value[6] = (uint8_t)age_sec;               /* lastContact */
 

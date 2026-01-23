@@ -2,7 +2,7 @@
 
 A Bluetooth audio receiver with real-time DSP processing and BLE GATT control interface for ESP32.
 
-**Version:** 1.1 | **Date:** 2026-01-22
+**Version:** 1.2 | **Date:** 2026-01-22
 
 ## Features
 
@@ -11,6 +11,7 @@ A Bluetooth audio receiver with real-time DSP processing and BLE GATT control in
 - **BLE GATT Control** - Change DSP settings wirelessly using any generic BLE app or the 42 Decibels iOS app
 - **Mute & Audio Duck** - Instant mute and panic button for quick volume reduction
 - **Normalizer (DRC)** - Dynamic range compression for late-night listening
+- **Volume Control** - Device-side volume trim with preset-based caps
 - **GalacticStatus** - Extended status reporting with periodic notifications (2x/sec)
 - **Persistent Settings** - Settings survive power cycles via NVS flash storage
 - **iOS Compatible** - Secure Simple Pairing (SSP) for seamless iOS pairing
@@ -68,7 +69,7 @@ idf.py merge-bin
 ### Bluetooth Audio (A2DP)
 
 1. Power on the ESP32
-2. Search for "ESP32 Speaker" in your device's Bluetooth settings
+2. Search for "42 Decibels" in your device's Bluetooth settings
 3. Pair and connect
 4. Play audio - it will stream to the speaker
 
@@ -77,7 +78,7 @@ idf.py merge-bin
 Use any BLE app (nRF Connect, LightBlue) to control DSP settings:
 
 1. Scan for BLE devices
-2. Connect to "ESP32 Speaker"
+2. Connect to "42 Decibels"
 3. Find the DSP Control Service (UUID: `00000001-1234-5678-9ABC-DEF012345678`)
 4. Write commands to the Control characteristic
 
@@ -116,6 +117,7 @@ Commands are 2 bytes: `[CMD] [VALUE]`
 | `0x05` | SET_AUDIO_DUCK | `0x01` | Audio Duck ON (reduces volume to ~25%) |
 | `0x06` | SET_NORMALIZER | `0x00` | Normalizer OFF |
 | `0x06` | SET_NORMALIZER | `0x01` | Normalizer ON (dynamic range compression) |
+| `0x07` | SET_VOLUME | `0x00-0x64` | Volume trim (0=mute, 100=full) |
 
 ### Status Notification Format (4 bytes)
 
@@ -148,7 +150,7 @@ Format: `[VER] [PRESET] [FLAGS] [ENERGY] [VOLUME] [BATTERY] [LAST_CONTACT]`
 | 1 | PRESET | Current preset (0-3) |
 | 2 | FLAGS | Shield status bitfield |
 | 3 | ENERGY | Reserved (0-100) |
-| 4 | VOLUME | Reserved (0-100) |
+| 4 | VOLUME | Effective volume level (0-100) |
 | 5 | BATTERY | Reserved (0-100) |
 | 6 | LAST_CONTACT | Seconds since last BLE communication (0-255) |
 
@@ -174,6 +176,9 @@ Format: `[VER] [PRESET] [FLAGS] [ENERGY] [VOLUME] [BATTERY] [LAST_CONTACT]`
 0501  - Audio Duck ON (panic button)
 0600  - Normalizer OFF
 0601  - Normalizer ON
+0764  - Set volume to 100%
+073C  - Set volume to 60%
+0700  - Set volume to 0% (mute)
 ```
 
 ## DSP Architecture
@@ -181,7 +186,7 @@ Format: `[VER] [PRESET] [FLAGS] [ENERGY] [VOLUME] [BATTERY] [LAST_CONTACT]`
 ### Signal Chain
 
 ```
-Input → Pre-gain (-6dB) → HPF (95Hz) → Preset EQ → Loudness EQ → Normalizer → Limiter → Audio Duck → Mute → Output
+Input → Pre-gain (-6dB) → HPF (95Hz) → Preset EQ → Loudness EQ → Normalizer → Limiter → Volume Trim → Audio Duck → Mute → Output
 ```
 
 ### Components
@@ -192,8 +197,9 @@ Input → Pre-gain (-6dB) → HPF (95Hz) → Preset EQ → Loudness EQ → Norma
 4. **Loudness Overlay**: 2-band shelf EQ (bass + treble boost)
 5. **Normalizer**: Dynamic range compression (threshold -20dB, ratio 4:1, +6dB makeup)
 6. **Limiter**: Peak limiter at -1 dBFS (3ms attack, 120ms release)
-7. **Audio Duck**: Volume reduction to ~25% (-12 dB) when activated
-8. **Mute**: Final output gate
+7. **Volume Trim**: Device-side volume control (0-100, capped by preset/normalizer)
+8. **Audio Duck**: Volume reduction to ~25% (-12 dB) when activated
+9. **Mute**: Final output gate
 
 ### Preset EQ Curves
 
@@ -278,7 +284,7 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 - **EQ Curves**: Edit `preset_params` array in `dsp_processor.c`
 - **Limiter Settings**: Adjust `DSP_LIMITER_*` defines in `dsp_processor.h`
 
-## Functional Requirements (FSD-DSP-001 v1.1)
+## Functional Requirements (FSD-DSP-001 v1.2)
 
 | ID | Requirement | Status |
 |----|-------------|--------|
@@ -303,6 +309,7 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 | FR-21 | Mute function with smooth fade | ✅ |
 | FR-22 | Audio Duck (panic button, -12 dB) | ✅ |
 | FR-23 | Normalizer (dynamic range compression) | ✅ |
+| FR-24 | Volume Control (device trim with caps) | ✅ |
 
 ## License
 

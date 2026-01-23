@@ -128,6 +128,11 @@ typedef struct {
     float audio_duck_gain;
     float audio_duck_gain_target;
 
+    /* Volume Trim (FR-24) - device-side volume control */
+    uint8_t volume_trim;            /* User-set volume (0-100) */
+    float volume_gain;              /* Actual volume gain (linear) */
+    float volume_gain_target;       /* Target volume gain (linear) */
+
     /* Normalizer/DRC (FR-22) - dynamic range compression */
     bool normalizer_enabled;
     float normalizer_envelope;
@@ -283,6 +288,49 @@ static float calc_smooth_coeff(float time_ms, float fs)
     return 1.0f - expf(-1.0f / time_samples);
 }
 
+/*
+ * Convert volume (0-100) to linear gain (FR-24)
+ * Uses logarithmic mapping per FSD Section 10.5:
+ *   100 → 0 dB
+ *   80 → -6 dB
+ *   60 → -12 dB
+ *   40 → -20 dB
+ *   20 → -35 dB
+ *   0 → mute
+ */
+static float volume_to_gain(uint8_t volume)
+{
+    if (volume == 0) {
+        return 0.0f;  /* Mute */
+    }
+    if (volume >= 100) {
+        return 1.0f;  /* 0 dB */
+    }
+
+    /* Use piecewise linear interpolation in dB domain for smooth curve */
+    float db;
+    float v = (float)volume;
+
+    if (volume >= 80) {
+        /* 80-100 → -6 to 0 dB */
+        db = -6.0f + (v - 80.0f) * (6.0f / 20.0f);
+    } else if (volume >= 60) {
+        /* 60-80 → -12 to -6 dB */
+        db = -12.0f + (v - 60.0f) * (6.0f / 20.0f);
+    } else if (volume >= 40) {
+        /* 40-60 → -20 to -12 dB */
+        db = -20.0f + (v - 40.0f) * (8.0f / 20.0f);
+    } else if (volume >= 20) {
+        /* 20-40 → -35 to -20 dB */
+        db = -35.0f + (v - 20.0f) * (15.0f / 20.0f);
+    } else {
+        /* 0-20 → -60 to -35 dB (approaching mute) */
+        db = -60.0f + v * (25.0f / 20.0f);
+    }
+
+    return DB_TO_LINEAR(db);
+}
+
 /* Calculate limiter coefficients */
 static void calc_limiter_coeffs(dsp_state_t *dsp)
 {
@@ -349,6 +397,11 @@ esp_err_t dsp_init(uint32_t sample_rate)
     s_dsp.audio_duck_enabled = false;
     s_dsp.audio_duck_gain = 1.0f;
     s_dsp.audio_duck_gain_target = 1.0f;
+
+    /* Initialize Volume Trim (FR-24) */
+    s_dsp.volume_trim = DSP_VOLUME_TRIM_DEFAULT;
+    s_dsp.volume_gain = 1.0f;
+    s_dsp.volume_gain_target = 1.0f;
 
     /* Initialize Normalizer/DRC (FR-22) */
     s_dsp.normalizer_enabled = false;
@@ -444,6 +497,10 @@ esp_err_t dsp_set_preset(dsp_preset_t preset)
         calc_eq_band(&s_dsp.eq_target[i], &preset_params[preset][i], fs);
     }
 
+    /* Update volume gain target (preset may affect volume cap - FR-24) */
+    uint8_t effective = dsp_get_effective_volume();
+    s_dsp.volume_gain_target = volume_to_gain(effective);
+
     return ESP_OK;
 }
 
@@ -538,12 +595,75 @@ esp_err_t dsp_set_normalizer(bool enabled)
         s_dsp.normalizer_gain = 1.0f;
     }
 
+    /* Update volume gain target (normalizer affects volume cap - FR-24) */
+    uint8_t effective = dsp_get_effective_volume();
+    s_dsp.volume_gain_target = volume_to_gain(effective);
+
     return ESP_OK;
 }
 
 bool dsp_get_normalizer(void)
 {
     return s_dsp.normalizer_enabled;
+}
+
+uint8_t dsp_get_volume_cap(void)
+{
+    uint8_t cap = 100;
+
+    /* NIGHT preset has a volume cap (FSD 10.4) */
+    if (s_dsp.preset == DSP_PRESET_NIGHT) {
+        cap = DSP_VOLUME_CAP_NIGHT;
+    }
+
+    /* Normalizer reduces headroom, so lower the cap (FSD 10.4) */
+    if (s_dsp.normalizer_enabled && cap > DSP_VOLUME_CAP_NORMALIZER_REDUCTION) {
+        cap -= DSP_VOLUME_CAP_NORMALIZER_REDUCTION;
+    }
+
+    return cap;
+}
+
+uint8_t dsp_get_effective_volume(void)
+{
+    uint8_t cap = dsp_get_volume_cap();
+    uint8_t effective = s_dsp.volume_trim;
+
+    if (effective > cap) {
+        effective = cap;
+    }
+
+    return effective;
+}
+
+esp_err_t dsp_set_volume_trim(uint8_t value)
+{
+    if (!s_dsp.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Clamp to valid range */
+    if (value > 100) {
+        value = 100;
+    }
+
+    if (value == s_dsp.volume_trim) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Setting volume trim: %d%% (cap: %d%%)", value, dsp_get_volume_cap());
+    s_dsp.volume_trim = value;
+
+    /* Calculate effective volume with cap applied */
+    uint8_t effective = dsp_get_effective_volume();
+    s_dsp.volume_gain_target = volume_to_gain(effective);
+
+    return ESP_OK;
+}
+
+uint8_t dsp_get_volume_trim(void)
+{
+    return s_dsp.volume_trim;
 }
 
 void dsp_get_status(dsp_status_t *status)
@@ -703,6 +823,11 @@ void dsp_process(int16_t *samples, uint32_t num_samples)
             right = fmaxf(-1.0f, fminf(1.0f, right));
         }
 
+        /* Volume Trim (FR-24) - device-side volume control */
+        s_dsp.volume_gain += s_dsp.smooth_coeff * (s_dsp.volume_gain_target - s_dsp.volume_gain);
+        left *= s_dsp.volume_gain;
+        right *= s_dsp.volume_gain;
+
         /* Audio Duck (FR-21) - smooth volume reduction for panic button */
         s_dsp.audio_duck_gain += s_dsp.smooth_coeff * (s_dsp.audio_duck_gain_target - s_dsp.audio_duck_gain);
         left *= s_dsp.audio_duck_gain;
@@ -790,6 +915,10 @@ void dsp_process_float(float *left, float *right, uint32_t num_frames)
 
         l *= s_dsp.limiter.gain;
         r *= s_dsp.limiter.gain;
+
+        /* Volume Trim (FR-24) */
+        l *= s_dsp.volume_gain;
+        r *= s_dsp.volume_gain;
 
         /* Audio Duck (FR-21) */
         l *= s_dsp.audio_duck_gain;

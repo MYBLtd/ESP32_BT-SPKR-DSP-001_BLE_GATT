@@ -44,7 +44,7 @@
 static const char *TAG = "BT_SPEAKER";
 
 /* Device name visible on Bluetooth */
-#define BT_DEVICE_NAME "ESP32 Speaker"
+#define BT_DEVICE_NAME "42 Decibels"
 
 /* I2S GPIO Configuration for MAX98357A */
 #define I2S_BCK_PIN     GPIO_NUM_26
