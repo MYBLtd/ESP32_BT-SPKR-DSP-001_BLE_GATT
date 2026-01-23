@@ -1,6 +1,6 @@
 # 42 Decibels BLE Protocol Documentation
 
-**Version:** 2.0
+**Version:** 2.1
 **Date:** 2026-01-23
 
 ## Overview
@@ -258,12 +258,210 @@ When Volume is set (`0x07 0xNN`):
 | 0x0002 | Control Write  | Write, Write Without Response | Send commands to device        |
 | 0x0003 | Status Notify  | Read, Notify                | Receive simple status updates   |
 | 0x0004 | Galactic Status| Read, Notify                | Receive comprehensive status    |
+| 0x0005 | OTA Credentials| Write                       | WiFi SSID + password for OTA    |
+| 0x0006 | OTA URL        | Write                       | Firmware download URL           |
+| 0x0007 | OTA Control    | Write                       | OTA commands (start/cancel/etc) |
+| 0x0008 | OTA Status     | Read, Notify                | OTA progress notifications      |
+
+---
+
+## OTA Firmware Update (FR-25)
+
+The device supports over-the-air firmware updates using a hybrid BLE + WiFi approach:
+1. WiFi credentials and firmware URL are provisioned via BLE
+2. Device connects to WiFi and downloads firmware
+3. Progress is reported via OTA Status notifications
+4. Device reboots to new firmware on command
+
+---
+
+## OTA Credentials (Characteristic: 0x0005)
+
+**UUID:** `00000005-1234-5678-9ABC-DEF012345678`
+**Properties:** Write
+**Size:** Up to 98 bytes
+
+### Format
+
+```
+[SSID (max 32 bytes)] [0x00 separator] [PASSWORD (max 64 bytes)]
+```
+
+Write WiFi credentials as: `SSID\0PASSWORD` (null-separated).
+
+### Example
+
+```
+// Connect to "MyWiFi" with password "secret123"
+4D 79 57 69 46 69 00 73 65 63 72 65 74 31 32 33
+```
+
+---
+
+## OTA URL (Characteristic: 0x0006)
+
+**UUID:** `00000006-1234-5678-9ABC-DEF012345678`
+**Properties:** Write
+**Size:** Up to 258 bytes
+
+### Format
+
+```
+[LENGTH_L] [LENGTH_H] [URL bytes...]
+```
+
+Or simply write the URL as a null-terminated string.
+
+### Example
+
+```
+// Set firmware URL
+https://example.com/firmware/v2.1.bin
+```
+
+---
+
+## OTA Control (Characteristic: 0x0007)
+
+**UUID:** `00000007-1234-5678-9ABC-DEF012345678`
+**Properties:** Write
+**Size:** 2 bytes
+
+### Command Format
+
+```
+[CMD] [PARAM]
+```
+
+### OTA Commands
+
+| CMD | Name | Param | Description |
+|-----|------|-------|-------------|
+| `0x10` | START | `0x00` | Start OTA download process |
+| `0x11` | CANCEL | `0x00` | Cancel active OTA operation |
+| `0x12` | REBOOT | `0x00` | Reboot to apply new firmware |
+| `0x13` | GET_VERSION | `0x00` | Request firmware version |
+| `0x14` | ROLLBACK | `0x00` | Rollback to previous firmware |
+| `0x15` | VALIDATE | `0x00` | Mark new firmware as valid |
+
+### Command Examples
+
+```
+// Start OTA download (after credentials and URL are set)
+0x10 0x00
+
+// Cancel OTA in progress
+0x11 0x00
+
+// Reboot to new firmware (after successful download)
+0x12 0x00
+
+// Rollback to previous firmware
+0x14 0x00
+
+// Validate new firmware (prevents auto-rollback)
+0x15 0x00
+```
+
+---
+
+## OTA Status (Characteristic: 0x0008)
+
+**UUID:** `00000008-1234-5678-9ABC-DEF012345678`
+**Properties:** Read, Notify
+**Size:** 8 bytes
+
+Status notifications are sent automatically during OTA operations.
+
+### Packet Format
+
+```
+[STATE][ERROR][PROGRESS][DL_KB_L][DL_KB_H][TOTAL_KB_L][TOTAL_KB_H][RSSI]
+   0      1       2         3        4         5           6        7
+```
+
+### Byte Descriptions
+
+| Byte | Field | Type | Description |
+|------|-------|------|-------------|
+| 0 | STATE | `uint8` | Current OTA state |
+| 1 | ERROR | `uint8` | Error code (0 = no error) |
+| 2 | PROGRESS | `uint8` | Download progress 0-100% |
+| 3-4 | DOWNLOADED_KB | `uint16` | Downloaded size in KB (little-endian) |
+| 5-6 | TOTAL_KB | `uint16` | Total firmware size in KB (little-endian) |
+| 7 | RSSI | `int8` | WiFi signal strength in dBm |
+
+### OTA States
+
+| Value | State | Description |
+|-------|-------|-------------|
+| `0x00` | IDLE | Ready for OTA, no operation in progress |
+| `0x01` | CREDS_RECEIVED | WiFi credentials received |
+| `0x02` | URL_RECEIVED | Firmware URL received |
+| `0x03` | WIFI_CONNECTING | Connecting to WiFi network |
+| `0x04` | WIFI_CONNECTED | WiFi connected, ready to download |
+| `0x05` | DOWNLOADING | Firmware download in progress |
+| `0x06` | VERIFYING | Verifying firmware integrity |
+| `0x07` | SUCCESS | OTA complete, ready for reboot |
+| `0x08` | PENDING_VERIFY | New firmware booted, awaiting validation |
+| `0xFF` | ERROR | Error occurred (see ERROR byte) |
+
+### OTA Error Codes
+
+| Value | Error | Description |
+|-------|-------|-------------|
+| `0x00` | NONE | No error |
+| `0x01` | WIFI_CONNECT | WiFi connection failed |
+| `0x02` | HTTP_CONNECT | HTTP connection to server failed |
+| `0x03` | HTTP_RESPONSE | HTTP error response (4xx/5xx) |
+| `0x04` | DOWNLOAD | Download failed (network error) |
+| `0x05` | VERIFY | Firmware verification failed |
+| `0x06` | WRITE | Flash write failed |
+| `0x07` | NO_CREDS | No WiFi credentials provided |
+| `0x08` | NO_URL | No firmware URL provided |
+| `0x09` | INVALID_IMAGE | Invalid firmware image |
+| `0x0A` | CANCELLED | OTA cancelled by user |
+| `0x0B` | ROLLBACK_FAILED | Rollback operation failed |
+
+### Example OTA Status
+
+```
+05 00 45 C8 00 20 03 D2
+```
+
+Interpretation:
+- State: `0x05` (DOWNLOADING)
+- Error: `0x00` (no error)
+- Progress: `0x45` = 69%
+- Downloaded: `0x00C8` = 200 KB
+- Total: `0x0320` = 800 KB
+- RSSI: `0xD2` = -46 dBm (good signal)
+
+---
+
+## OTA Workflow
+
+### Typical OTA Update Sequence
+
+1. **Provision Credentials**: Write WiFi SSID/password to 0x0005
+2. **Set URL**: Write firmware URL to 0x0006
+3. **Start OTA**: Write `0x10 0x00` to 0x0007
+4. **Monitor Progress**: Subscribe to 0x0008 notifications
+5. **Wait for Success**: STATE becomes `0x07`
+6. **Reboot**: Write `0x12 0x00` to 0x0007
+7. **Validate** (after reboot): Write `0x15 0x00` to 0x0007
+
+### Firmware Rollback
+
+If the new firmware fails to validate within a certain period, or on user request:
+1. Write `0x14 0x00` to OTA Control (0x0007)
+2. Device reboots to previous firmware
 
 ---
 
 ## Quick Reference
 
-### All Commands (Hex)
+### DSP Commands (Write to 0x0002)
 
 ```
 0100  - Set preset to OFFICE
@@ -284,10 +482,22 @@ When Volume is set (`0x07 0xNN`):
 0700  - Set volume to 0% (mute)
 ```
 
+### OTA Commands (Write to 0x0007)
+
+```
+1000  - Start OTA download
+1100  - Cancel OTA
+1200  - Reboot to new firmware
+1300  - Get firmware version
+1400  - Rollback to previous firmware
+1500  - Validate new firmware
+```
+
 ---
 
 ## Testing Checklist
 
+### DSP Features
 - [x] Mute silences audio completely
 - [x] Mute uses smooth fade (no clicks)
 - [x] Audio Duck reduces volume to ~25%
@@ -306,6 +516,16 @@ When Volume is set (`0x07 0xNN`):
 - [ ] Normalizer reduces volume cap for headroom
 - [ ] Galactic Status byte 4 reflects effective volume
 
+### OTA Features
+- [ ] WiFi credentials can be written to 0x0005
+- [ ] Firmware URL can be written to 0x0006
+- [ ] OTA Start command initiates WiFi connection
+- [ ] OTA Status notifications show progress
+- [ ] OTA can be cancelled mid-download
+- [ ] Reboot command applies new firmware
+- [ ] Rollback command restores previous firmware
+- [ ] Validate command prevents auto-rollback
+
 ---
 
-*Last Updated: 2026-01-23 (v2.0)*
+*Last Updated: 2026-01-23 (v2.1)*
