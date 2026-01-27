@@ -22,6 +22,23 @@ static const char *TAG = "DSP";
 #define DB_TO_LINEAR(db) (powf(10.0f, (db) / 20.0f))
 #define LINEAR_TO_DB(lin) (20.0f * log10f(lin))
 
+/*
+ * Fast power approximation using IEEE 754 float bit manipulation
+ * Much faster than powf() on ESP32 (no hardware transcendental support)
+ * Accuracy is ~5% which is acceptable for audio dynamics processing
+ */
+static inline float fast_powf_approx(float x, float p)
+{
+    /* Handle edge cases */
+    if (x <= 0.0f) return 0.0f;
+    if (x == 1.0f) return 1.0f;
+
+    /* IEEE 754 bit trick: log2(x) ≈ (float_bits - 127*2^23) / 2^23 */
+    union { float f; uint32_t i; } u = { .f = x };
+    u.i = (uint32_t)(p * (float)(u.i - 1065353216) + 1065353216.0f);
+    return u.f;
+}
+
 /* Sample scaling */
 #define INT16_TO_FLOAT(x) ((float)(x) / 32768.0f)
 #define FLOAT_TO_INT16(x) ((int16_t)fmaxf(-32768.0f, fminf(32767.0f, (x) * 32768.0f)))
@@ -73,10 +90,10 @@ static const eq_band_params_t preset_params[DSP_PRESET_COUNT][DSP_NUM_EQ_BANDS] 
     }
 };
 
-/* Loudness overlay parameters (Section 9.1) */
+/* Loudness overlay parameters (Section 9.1) - Aggressive loudness curve */
 static const eq_band_params_t loudness_params[DSP_NUM_LOUDNESS_BANDS] = {
-    { 140.0f,  +2.5f, 0.8f, EQ_TYPE_LOWSHELF },
-    { 8500.0f, +1.0f, 0.7f, EQ_TYPE_HIGHSHELF }
+    { 120.0f,  +6.0f, 0.7f, EQ_TYPE_LOWSHELF },   /* Deep bass boost */
+    { 10000.0f, +3.0f, 0.6f, EQ_TYPE_HIGHSHELF }  /* Brighter treble */
 };
 
 /* Preset names */
@@ -563,10 +580,11 @@ esp_err_t dsp_set_audio_duck(bool enabled)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "Setting audio duck: %s", enabled ? "ON" : "OFF");
+    /* Audio Duck is now repurposed as DSP BYPASS mode for debugging */
+    ESP_LOGI(TAG, "Setting DSP BYPASS: %s", enabled ? "ON (no processing)" : "OFF (normal DSP)");
     s_dsp.audio_duck_enabled = enabled;
-    /* ~25% volume = -12 dB reduction when enabled */
-    s_dsp.audio_duck_gain_target = enabled ? DB_TO_LINEAR(DSP_AUDIO_DUCK_GAIN_DB) : 1.0f;
+    /* Keep gain at 1.0 - bypass just skips processing, doesn't change volume */
+    s_dsp.audio_duck_gain_target = 1.0f;
 
     return ESP_OK;
 }
@@ -711,8 +729,27 @@ void dsp_process(int16_t *samples, uint32_t num_samples)
         return;
     }
 
+    /* BYPASS MODE: Skip all DSP processing when audio_duck (bypass) is enabled */
+    if (s_dsp.audio_duck_enabled) {
+        /* Pass audio through unchanged - useful for debugging */
+        return;
+    }
+
     /* Process stereo interleaved samples */
     uint32_t num_frames = num_samples / 2;
+
+    /* Block-based normalizer: find peak of entire buffer first (optimization) */
+    float block_peak = 0.0f;
+    if (s_dsp.normalizer_enabled) {
+        for (uint32_t i = 0; i < num_frames; i++) {
+            float l = fabsf(INT16_TO_FLOAT(samples[i * 2]));
+            float r = fabsf(INT16_TO_FLOAT(samples[i * 2 + 1]));
+            float p = (l > r) ? l : r;
+            if (p > block_peak) block_peak = p;
+        }
+        /* Apply pre-gain to peak for accurate envelope tracking */
+        block_peak *= s_dsp.pre_gain;
+    }
 
     for (uint32_t i = 0; i < num_frames; i++) {
         /* Convert to float */
@@ -762,25 +799,23 @@ void dsp_process(int16_t *samples, uint32_t num_samples)
             right = right * (1.0f - s_dsp.loudness_gain) + loud_right * s_dsp.loudness_gain;
         }
 
-        /* Normalizer/DRC (FR-22) - dynamic range compression */
+        /* Normalizer/DRC (FR-22) - block-based dynamic range compression
+         * Uses block peak (calculated once per buffer) for envelope tracking
+         * to reduce CPU load. Gain is still applied per-sample for smoothness. */
         if (s_dsp.normalizer_enabled) {
-            float norm_peak = fmaxf(fabsf(left), fabsf(right));
-
-            /* Update envelope with attack/release */
-            if (norm_peak > s_dsp.normalizer_envelope) {
+            /* Update envelope using block peak (much cheaper than per-sample) */
+            if (block_peak > s_dsp.normalizer_envelope) {
                 s_dsp.normalizer_envelope += s_dsp.normalizer_attack_coeff *
-                                            (norm_peak - s_dsp.normalizer_envelope);
+                                            (block_peak - s_dsp.normalizer_envelope);
             } else {
                 s_dsp.normalizer_envelope += s_dsp.normalizer_release_coeff *
-                                            (norm_peak - s_dsp.normalizer_envelope);
+                                            (block_peak - s_dsp.normalizer_envelope);
             }
 
-            /* Calculate compression gain */
+            /* Calculate compression gain (only when above threshold) */
             if (s_dsp.normalizer_envelope > s_dsp.normalizer_threshold) {
-                /* Compression: gain = threshold / envelope^(1 - 1/ratio) */
-                /* For ratio 4:1: if input is 4dB above threshold, output is 1dB above */
                 float over_threshold = s_dsp.normalizer_envelope / s_dsp.normalizer_threshold;
-                float compressed = powf(over_threshold, 1.0f - 1.0f / s_dsp.normalizer_ratio);
+                float compressed = fast_powf_approx(over_threshold, 1.0f - 1.0f / s_dsp.normalizer_ratio);
                 s_dsp.normalizer_gain = 1.0f / compressed;
             } else {
                 s_dsp.normalizer_gain = 1.0f;
@@ -889,7 +924,7 @@ void dsp_process_float(float *left, float *right, uint32_t num_frames)
 
             if (s_dsp.normalizer_envelope > s_dsp.normalizer_threshold) {
                 float over_threshold = s_dsp.normalizer_envelope / s_dsp.normalizer_threshold;
-                float compressed = powf(over_threshold, 1.0f - 1.0f / s_dsp.normalizer_ratio);
+                float compressed = fast_powf_approx(over_threshold, 1.0f - 1.0f / s_dsp.normalizer_ratio);
                 s_dsp.normalizer_gain = 1.0f / compressed;
             } else {
                 s_dsp.normalizer_gain = 1.0f;

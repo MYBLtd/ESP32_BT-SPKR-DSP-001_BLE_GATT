@@ -458,8 +458,9 @@ static void handle_control_write(const uint8_t *data, uint16_t len)
 
     case DSP_CMD_SET_AUDIO_DUCK:
         dsp_set_audio_duck(val != 0);
-        settings_changed = true;
-        ESP_LOGI(TAG, "Audio Duck set to: %s", val ? "ON" : "OFF");
+        /* Note: Bypass state is not persisted to NVS (debug feature only) */
+        settings_changed = false;
+        ESP_LOGI(TAG, "DSP Bypass set to: %s", val ? "ON (raw audio)" : "OFF (DSP active)");
         break;
 
     case DSP_CMD_SET_NORMALIZER:
