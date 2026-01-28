@@ -457,10 +457,10 @@ static void handle_control_write(const uint8_t *data, uint16_t len)
         break;
 
     case DSP_CMD_SET_AUDIO_DUCK:
+        /* FR-21: Panic button - reduces volume to ~25% */
         dsp_set_audio_duck(val != 0);
-        /* Note: Bypass state is not persisted to NVS (debug feature only) */
-        settings_changed = false;
-        ESP_LOGI(TAG, "DSP Bypass set to: %s", val ? "ON (raw audio)" : "OFF (DSP active)");
+        settings_changed = false;  /* Not persisted - panic state resets on reboot */
+        ESP_LOGI(TAG, "Audio Duck set to: %s", val ? "ON (volume reduced)" : "OFF");
         break;
 
     case DSP_CMD_SET_NORMALIZER:
@@ -474,6 +474,20 @@ static void handle_control_write(const uint8_t *data, uint16_t len)
         dsp_set_volume_trim(val);
         settings_changed = true;
         ESP_LOGI(TAG, "Volume set to: %d%% (effective: %d%%)", val, dsp_get_effective_volume());
+        break;
+
+    case DSP_CMD_SET_BYPASS:
+        /* Debug feature: Skip EQ/filters, keep safety processing (pre-gain, limiter, volume) */
+        dsp_set_bypass(val != 0);
+        settings_changed = false;  /* Not persisted - debug feature resets on reboot */
+        ESP_LOGI(TAG, "DSP Bypass set to: %s", val ? "ON (EQ bypassed)" : "OFF (full DSP)");
+        break;
+
+    case DSP_CMD_SET_BASS_BOOST:
+        /* Bass boost: +8dB low-shelf at 100Hz */
+        dsp_set_bass_boost(val != 0);
+        settings_changed = true;  /* Persisted - user preference */
+        ESP_LOGI(TAG, "Bass Boost set to: %s", val ? "ON" : "OFF");
         break;
 
     default:
@@ -532,6 +546,8 @@ static void update_galactic_status_value(void)
      * Bit 1 (0x02): Audio Duck (panic mode)
      * Bit 2 (0x04): Loudness
      * Bit 3 (0x08): Normalizer (DRC active)
+     * Bit 4 (0x10): DSP Bypass (EQ bypassed)
+     * Bit 5 (0x20): Bass Boost
      */
     uint8_t shield_status = 0;
     if (dsp_get_mute()) {
@@ -545,6 +561,12 @@ static void update_galactic_status_value(void)
     }
     if (dsp_get_normalizer()) {
         shield_status |= 0x08;  /* Bit 3: Normalizer */
+    }
+    if (dsp_get_bypass()) {
+        shield_status |= 0x10;  /* Bit 4: DSP Bypass */
+    }
+    if (dsp_get_bass_boost()) {
+        shield_status |= 0x20;  /* Bit 5: Bass Boost */
     }
 
     galactic_value[0] = DSP_GALACTIC_PROTOCOL_VERSION;  /* Protocol version: 0x42 */

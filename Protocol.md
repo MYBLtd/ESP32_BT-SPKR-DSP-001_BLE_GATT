@@ -1,7 +1,7 @@
 # 42 Decibels BLE Protocol Documentation
 
-**Version:** 2.1
-**Date:** 2026-01-23
+**Version:** 2.3.0
+**Date:** 2026-01-28
 
 ## Overview
 
@@ -33,9 +33,11 @@ All commands are sent as 2-byte packets: `[COMMAND_TYPE, VALUE]`
 | **Set Loudness** | `0x02` | `0x00-0x01` | Enable/disable loudness compensation |
 | **Request Status** | `0x03` | `0x00` | Request full status update |
 | **Set Mute** | `0x04` | `0x00-0x01` | Mute/unmute audio completely |
-| **Set Audio Duck** | `0x05` | `0x00-0x01` | Enable/disable Audio Duck (volume reduction) |
+| **Set Audio Duck** | `0x05` | `0x00-0x01` | Enable/disable Audio Duck (panic volume reduction) |
 | **Set Normalizer** | `0x06` | `0x00-0x01` | Enable/disable Normalizer/DRC |
 | **Set Volume** | `0x07` | `0x00-0x64` | Set volume trim (0=mute, 100=full) |
+| **Set Bypass** | `0x08` | `0x00-0x01` | Enable/disable DSP Bypass (skip EQ, keep safety) |
+| **Set Bass Boost** | `0x09` | `0x00-0x01` | Enable/disable Bass Boost (+8dB @ 100Hz) |
 
 ### Preset Values (for Command 0x01)
 
@@ -81,6 +83,18 @@ All commands are sent as 2-byte packets: `[COMMAND_TYPE, VALUE]`
 
 // Set volume to 0% (mute)
 0x07 0x00
+
+// Enable DSP Bypass (skip EQ, keep safety processing)
+0x08 0x01
+
+// Disable DSP Bypass (full DSP processing)
+0x08 0x00
+
+// Enable Bass Boost (+8dB @ 100Hz)
+0x09 0x01
+
+// Disable Bass Boost
+0x09 0x00
 ```
 
 ---
@@ -117,7 +131,8 @@ The device sends status updates via notifications on this characteristic after e
 | 3   | 0x08 | Muted           | Audio is muted                 |
 | 4   | 0x10 | Audio Duck      | Volume reduced (panic mode)    |
 | 5   | 0x20 | Normalizer      | DRC enabled                    |
-| 6-7 | -    | Reserved        | Future use                     |
+| 6   | 0x40 | Bypass          | DSP Bypass active              |
+| 7   | -    | Reserved        | Future use                     |
 
 ---
 
@@ -156,7 +171,9 @@ This characteristic provides a comprehensive status snapshot. It is automaticall
 | 1   | `0x02` | Audio Duck | Volume reduced (panic mode)       |
 | 2   | `0x04` | Loudness   | Loudness compensation enabled     |
 | 3   | `0x08` | Normalizer | Dynamic range compression enabled |
-| 4-7 | -      | Reserved   | Future use                        |
+| 4   | `0x10` | Bypass     | DSP Bypass active (v2.3+)         |
+| 5   | `0x20` | Bass Boost | Bass Boost enabled (v2.3+)        |
+| 6-7 | -      | Reserved   | Future use                        |
 
 ### Last Contact Behavior
 
@@ -177,17 +194,19 @@ Since GalacticStatus is notified every 500ms, this value should typically be `0x
 ### Example Galactic Status
 
 ```
-42 01 06 64 50 64 00
+42 01 26 64 50 64 00
 ```
 
 Interpretation:
 - Protocol Version: `0x42` ✓
 - Preset: `0x01` (FULL)
-- Shield Status: `0x06` (bits 1 and 2 set)
+- Shield Status: `0x26` (bits 1, 2, and 5 set)
   - Muted: NO
   - Audio Duck: YES (volume reduced)
   - Loudness: YES
   - Normalizer: NO
+  - Bypass: NO
+  - Bass Boost: YES
 - Energy Core: 100%
 - Volume: 50%
 - Battery: 100%
@@ -197,7 +216,37 @@ Interpretation:
 
 ## Implementation Details
 
-### Audio Duck (FR-22)
+### DSP Bypass (v2.3+)
+
+When DSP Bypass is enabled (`0x08 0x01`):
+
+**Skipped stages:**
+- High-pass filter (95Hz)
+- Preset EQ (4 bands)
+- Loudness overlay
+- Bass Boost
+- Normalizer/DRC
+
+**Kept stages (for safety):**
+- Pre-gain (-3dB headroom)
+- Limiter (-1dBFS peak protection)
+- Volume trim
+- Audio Duck
+- Mute
+
+This ensures hot-mastered tracks don't clip the DAC/amplifier even when testing "raw" audio.
+
+### Bass Boost (v2.3+)
+
+When Bass Boost is enabled (`0x09 0x01`):
+1. Apply low-shelf filter: +8dB @ 100Hz (S=0.7)
+2. Use smooth gain crossfade (no clicks)
+3. Set bit 5 in Shield Status byte
+4. Setting is persisted to NVS
+
+Bass Boost is ideal for small speakers that lack natural bass response.
+
+### Audio Duck (FR-21)
 
 When Audio Duck is enabled (`0x05 0x01`):
 1. Apply -12 dB gain reduction (~25% volume)
@@ -211,7 +260,7 @@ When Audio Duck is disabled (`0x05 0x00`):
 3. Clear bit 1 in Shield Status byte
 4. Update and notify GalacticStatus
 
-### Normalizer/DRC (FR-23)
+### Normalizer/DRC (FR-22)
 
 When Normalizer is enabled (`0x06 0x01`):
 1. Enable dynamic range compression in DSP chain
@@ -316,7 +365,7 @@ Or simply write the URL as a null-terminated string.
 
 ```
 // Set firmware URL
-https://example.com/firmware/v2.1.bin
+https://example.com/firmware/v2.3.bin
 ```
 
 ---
@@ -474,12 +523,16 @@ If the new firmware fails to validate within a certain period, or on user reques
 0400  - Unmute
 0401  - Mute
 0500  - Disable Audio Duck
-0501  - Enable Audio Duck
+0501  - Enable Audio Duck (-12dB panic)
 0600  - Disable Normalizer
 0601  - Enable Normalizer
 0764  - Set volume to 100%
 073C  - Set volume to 60%
 0700  - Set volume to 0% (mute)
+0800  - Disable DSP Bypass
+0801  - Enable DSP Bypass (skip EQ, keep safety)
+0900  - Disable Bass Boost
+0901  - Enable Bass Boost (+8dB @ 100Hz)
 ```
 
 ### OTA Commands (Write to 0x0007)
@@ -503,29 +556,35 @@ If the new firmware fails to validate within a certain period, or on user reques
 - [x] Audio Duck reduces volume to ~25%
 - [x] Audio Duck uses smooth transition
 - [x] Normalizer applies compression
-- [x] Galactic Status bit 0 reflects Mute state
-- [x] Galactic Status bit 1 reflects Audio Duck state
-- [x] Galactic Status bit 2 reflects Loudness state
-- [x] Galactic Status bit 3 reflects Normalizer state
+- [x] Volume trim 0-100 adjusts audio level
+- [x] Volume uses smooth transition (no clicks)
+- [x] NIGHT preset caps volume at 60%
+- [x] Normalizer reduces volume cap for headroom
+- [x] DSP Bypass skips EQ but keeps safety stages
+- [x] Bass Boost adds +8dB @ 100Hz
+- [x] Bass Boost uses smooth crossfade
+
+### GalacticStatus
+- [x] Bit 0 reflects Mute state
+- [x] Bit 1 reflects Audio Duck state
+- [x] Bit 2 reflects Loudness state
+- [x] Bit 3 reflects Normalizer state
+- [x] Bit 4 reflects Bypass state
+- [x] Bit 5 reflects Bass Boost state
+- [x] Byte 4 reflects effective volume
 - [x] Last Contact resets on notifications
 - [x] Last Contact shows 0-1 during active connection
-- [x] All features work independently
-- [ ] Volume trim 0-100 adjusts audio level
-- [ ] Volume uses smooth transition (no clicks)
-- [ ] NIGHT preset caps volume at 60%
-- [ ] Normalizer reduces volume cap for headroom
-- [ ] Galactic Status byte 4 reflects effective volume
 
 ### OTA Features
-- [ ] WiFi credentials can be written to 0x0005
-- [ ] Firmware URL can be written to 0x0006
-- [ ] OTA Start command initiates WiFi connection
-- [ ] OTA Status notifications show progress
-- [ ] OTA can be cancelled mid-download
-- [ ] Reboot command applies new firmware
-- [ ] Rollback command restores previous firmware
-- [ ] Validate command prevents auto-rollback
+- [x] WiFi credentials can be written to 0x0005
+- [x] Firmware URL can be written to 0x0006
+- [x] OTA Start command initiates WiFi connection
+- [x] OTA Status notifications show progress
+- [x] OTA can be cancelled mid-download
+- [x] Reboot command applies new firmware
+- [x] Rollback command restores previous firmware
+- [x] Validate command prevents auto-rollback
 
 ---
 
-*Last Updated: 2026-01-23 (v2.1)*
+*Last Updated: 2026-01-28 (v2.3.0)*

@@ -2,14 +2,16 @@
 
 A Bluetooth audio receiver with real-time DSP processing and BLE GATT control interface for ESP32.
 
-**Version:** 2.2 | **Date:** 2026-01-28
+**Version:** 2.3.0 | **Date:** 2026-01-28
 
 ## Features
 
 - **Bluetooth A2DP Sink** - Receive high-quality audio from phones, tablets, and computers
-- **Real-time DSP Processing** - EQ presets, loudness enhancement, normalizer, and output limiting
+- **Real-time DSP Processing** - EQ presets, loudness enhancement, bass boost, normalizer, and output limiting
 - **BLE GATT Control** - Change DSP settings wirelessly using any generic BLE app or the 42 Decibels iOS app
-- **Mute & DSP Bypass** - Instant mute and bypass mode for debugging
+- **Bass Boost** - Dedicated +8dB low-shelf boost at 100Hz for small speakers
+- **Mute & DSP Bypass** - Instant mute and bypass mode for debugging (bypass keeps safety processing)
+- **Audio Duck** - Panic button for instant volume reduction
 - **Normalizer (DRC)** - Dynamic range compression for late-night listening
 - **Volume Control** - Device-side volume trim with preset-based caps
 - **OTA Firmware Updates** - Over-the-air updates via BLE provisioning + WiFi download
@@ -113,16 +115,14 @@ Commands are 2 bytes: `[CMD] [VALUE]`
 | `0x01` | SET_PRESET | `0x01` | FULL - Rich bass and treble enhancement |
 | `0x01` | SET_PRESET | `0x02` | NIGHT - Balanced for low volume listening |
 | `0x01` | SET_PRESET | `0x03` | SPEECH - Voice clarity for podcasts |
-| `0x02` | SET_LOUDNESS | `0x00` | Loudness OFF |
-| `0x02` | SET_LOUDNESS | `0x01` | Loudness ON |
+| `0x02` | SET_LOUDNESS | `0x00`/`0x01` | Loudness OFF/ON |
 | `0x03` | GET_STATUS | `0x00` | Request status notification |
-| `0x04` | SET_MUTE | `0x00` | Unmute audio |
-| `0x04` | SET_MUTE | `0x01` | Mute audio |
-| `0x05` | SET_BYPASS | `0x00` | DSP Bypass OFF (normal processing) |
-| `0x05` | SET_BYPASS | `0x01` | DSP Bypass ON (raw Bluetooth audio) |
-| `0x06` | SET_NORMALIZER | `0x00` | Normalizer OFF |
-| `0x06` | SET_NORMALIZER | `0x01` | Normalizer ON (dynamic range compression) |
+| `0x04` | SET_MUTE | `0x00`/`0x01` | Unmute/Mute audio |
+| `0x05` | SET_AUDIO_DUCK | `0x00`/`0x01` | Audio Duck OFF/ON (panic volume) |
+| `0x06` | SET_NORMALIZER | `0x00`/`0x01` | Normalizer (DRC) OFF/ON |
 | `0x07` | SET_VOLUME | `0x00-0x64` | Volume trim (0=mute, 100=full) |
+| `0x08` | SET_BYPASS | `0x00`/`0x01` | DSP Bypass OFF/ON (skip EQ, keep safety) |
+| `0x09` | SET_BASS_BOOST | `0x00`/`0x01` | Bass Boost OFF/ON (+8dB @ 100Hz) |
 
 ### Status Notification Format (4 bytes)
 
@@ -142,6 +142,7 @@ Format: `[VERSION] [PRESET] [LOUDNESS] [FLAGS]`
 - Bit 3: Muted
 - Bit 4: Audio Duck active
 - Bit 5: Normalizer active
+- Bit 6: DSP Bypass active
 
 ### GalacticStatus Format (7 bytes)
 
@@ -161,9 +162,11 @@ Format: `[VER] [PRESET] [FLAGS] [ENERGY] [VOLUME] [BATTERY] [LAST_CONTACT]`
 
 **Shield Status FLAGS (byte 2):**
 - Bit 0 (0x01): Muted
-- Bit 1 (0x02): DSP Bypass active
+- Bit 1 (0x02): Audio Duck active
 - Bit 2 (0x04): Loudness enabled
 - Bit 3 (0x08): Normalizer enabled
+- Bit 4 (0x10): DSP Bypass active
+- Bit 5 (0x20): Bass Boost enabled
 
 ### Example Commands (Hex)
 
@@ -177,13 +180,17 @@ Format: `[VER] [PRESET] [FLAGS] [ENERGY] [VOLUME] [BATTERY] [LAST_CONTACT]`
 0300  - Request status
 0400  - Unmute
 0401  - Mute
-0500  - DSP Bypass OFF (normal processing)
-0501  - DSP Bypass ON (raw audio, debug)
+0500  - Audio Duck OFF (normal volume)
+0501  - Audio Duck ON (panic mode, -12dB)
 0600  - Normalizer OFF
 0601  - Normalizer ON
 0764  - Set volume to 100%
 073C  - Set volume to 60%
 0700  - Set volume to 0% (mute)
+0800  - DSP Bypass OFF (full DSP processing)
+0801  - DSP Bypass ON (skip EQ, keep safety)
+0900  - Bass Boost OFF
+0901  - Bass Boost ON (+8dB @ 100Hz)
 ```
 
 ### OTA Commands (Write to OTA Control characteristic)
@@ -215,38 +222,51 @@ Format: `[STATE] [ERROR] [PROGRESS] [DL_KB_L] [DL_KB_H] [TOTAL_KB_L] [TOTAL_KB_H
 ### Signal Chain
 
 ```
-Input → [Bypass?] → Pre-gain (-6dB) → HPF (95Hz) → Preset EQ → Loudness EQ → Normalizer → Limiter → Volume Trim → Mute → Output
+Input → Pre-gain (-3dB) → HPF (95Hz) → Preset EQ → Loudness → Bass Boost → Normalizer → Limiter → Volume → Duck → Mute → Output
+        ↑
+        └── Always applied (even in Bypass mode: skips HPF through Bass Boost, keeps safety stages)
 ```
 
 ### Components
 
-1. **Bypass Mode**: Skip all DSP processing (debug feature)
-2. **Pre-gain**: -6 dB headroom for EQ boosts
-3. **High-pass Filter**: 2nd-order Butterworth at 95 Hz (driver protection)
-4. **Preset EQ**: 4-band parametric EQ per preset
-5. **Loudness Overlay**: 2-band shelf EQ (aggressive bass + treble boost)
-6. **Normalizer**: Block-based DRC with fast_powf optimization (threshold -20dB, ratio 4:1, +6dB makeup)
-7. **Limiter**: Peak limiter at -1 dBFS (3ms attack, 120ms release)
+1. **Pre-gain**: -3 dB headroom for EQ boosts (always active, even in bypass)
+2. **High-pass Filter**: 2nd-order Butterworth at 95 Hz (driver protection)
+3. **Preset EQ**: 4-band parametric EQ per preset
+4. **Loudness Overlay**: 2-band shelf EQ (bass +12dB @ 80Hz, treble +6dB @ 12kHz)
+5. **Bass Boost**: Low-shelf +8dB @ 100Hz (new in v2.3)
+6. **Normalizer**: Block-based DRC (threshold -20dB, ratio 4:1, +6dB makeup)
+7. **Limiter**: Peak limiter at -1 dBFS (3ms attack, 120ms release) - always active
 8. **Volume Trim**: Device-side volume control (0-100, capped by preset/normalizer)
-9. **Mute**: Final output gate
+9. **Audio Duck**: Panic button volume reduction (-12dB)
+10. **Mute**: Final output gate
+
+### Bypass Mode Behavior (v2.3)
+
+When bypass is enabled, the following stages are **skipped**:
+- HPF, Preset EQ, Loudness, Bass Boost, Normalizer
+
+The following stages **remain active** for safety:
+- Pre-gain (headroom), Limiter, Volume, Audio Duck, Mute
+
+This ensures hot-mastered tracks don't clip even when testing "raw" audio.
 
 ### Preset EQ Curves
 
 #### OFFICE (Background/Mild)
 | Band | Type | Frequency | Gain | Q/Slope |
 |------|------|-----------|------|---------|
-| 1 | Low-shelf | 160 Hz | +1.5 dB | S=0.7 |
-| 2 | Peaking | 320 Hz | -1.0 dB | Q=1.0 |
-| 3 | Peaking | 2800 Hz | -1.5 dB | Q=1.0 |
-| 4 | High-shelf | 9000 Hz | +0.5 dB | S=0.7 |
+| 1 | Low-shelf | 150 Hz | +3.0 dB | S=0.7 |
+| 2 | Peaking | 350 Hz | -1.5 dB | Q=1.0 |
+| 3 | Peaking | 3000 Hz | +1.0 dB | Q=1.0 |
+| 4 | High-shelf | 9000 Hz | +2.0 dB | S=0.7 |
 
 #### FULL (Rich/Enhanced)
 | Band | Type | Frequency | Gain | Q/Slope |
 |------|------|-----------|------|---------|
-| 1 | Low-shelf | 140 Hz | +4.0 dB | S=0.8 |
-| 2 | Peaking | 420 Hz | -1.5 dB | Q=1.0 |
-| 3 | Peaking | 3200 Hz | +0.7 dB | Q=1.0 |
-| 4 | High-shelf | 9500 Hz | +1.5 dB | S=0.7 |
+| 1 | Low-shelf | 100 Hz | +9.0 dB | S=0.7 |
+| 2 | Peaking | 300 Hz | -2.0 dB | Q=1.0 |
+| 3 | Peaking | 3500 Hz | +3.0 dB | Q=1.2 |
+| 4 | High-shelf | 10000 Hz | +5.0 dB | S=0.7 |
 
 #### NIGHT (Low Volume)
 | Band | Type | Frequency | Gain | Q/Slope |
@@ -267,8 +287,13 @@ Input → [Bypass?] → Pre-gain (-6dB) → HPF (95Hz) → Preset EQ → Loudnes
 ### Loudness Overlay (Aggressive)
 | Band | Type | Frequency | Gain | Q/Slope |
 |------|------|-----------|------|---------|
-| L1 | Low-shelf | 120 Hz | +6.0 dB | S=0.7 |
-| L2 | High-shelf | 10000 Hz | +3.0 dB | S=0.6 |
+| L1 | Low-shelf | 80 Hz | +12.0 dB | S=0.6 |
+| L2 | High-shelf | 12000 Hz | +6.0 dB | S=0.5 |
+
+### Bass Boost (New in v2.3)
+| Type | Frequency | Gain | Slope |
+|------|-----------|------|-------|
+| Low-shelf | 100 Hz | +8.0 dB | S=0.7 |
 
 ## Project Structure
 
@@ -318,34 +343,34 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 - **I2S Pins**: Modify `I2S_BCK_PIN`, `I2S_WS_PIN`, `I2S_DATA_PIN` in `main.c`
 - **EQ Curves**: Edit `preset_params` array in `dsp_processor.c`
 - **Limiter Settings**: Adjust `DSP_LIMITER_*` defines in `dsp_processor.h`
+- **Bass Boost Settings**: Adjust `DSP_BASS_BOOST_*` defines in `dsp_processor.h`
 
-## Functional Requirements (FSD-DSP-001 v2.2)
+## Changelog
 
-| ID | Requirement | Status |
-|----|-------------|--------|
-| FR-1 | Bluetooth device name publishing | ✅ |
-| FR-2 | iOS Bluetooth security (SSP) | ✅ |
-| FR-3 | A2DP audio stream receiving | ✅ |
-| FR-4/5 | I2S audio output | ✅ |
-| FR-6 | Watchdog crash recovery | ✅ |
-| FR-7 | DSP pre-gain headroom (-6 dB) | ✅ |
-| FR-8 | DSP presets (4 presets) | ✅ |
-| FR-9 | Loudness toggle | ✅ |
-| FR-11 | Safety limiter | ✅ |
-| FR-12 | Persistent NVS storage | ✅ |
-| FR-13 | Click-free parameter updates | ✅ |
-| FR-14 | Control latency < 150ms | ✅ |
-| FR-15 | BLE stability (no A2DP interruption) | ✅ |
-| FR-16 | Real-time DSP budget (240MHz, optimized) | ✅ |
-| FR-17 | No dynamic allocation in audio path | ✅ |
-| FR-18 | GalacticStatus characteristic (7 bytes) | ✅ |
-| FR-19 | Last contact tracking | ✅ |
-| FR-20 | Periodic status notifications (500ms) | ✅ |
-| FR-21 | Mute function with smooth fade | ✅ |
-| FR-22 | DSP Bypass mode (debug) | ✅ |
-| FR-23 | Normalizer (block-based DRC) | ✅ |
-| FR-24 | Volume Control (device trim with caps) | ✅ |
-| FR-25 | OTA firmware updates (BLE+WiFi hybrid) | ✅ |
+### v2.3.0 (2026-01-28)
+- **New:** Bass Boost feature (+8dB @ 100Hz) - command 0x09
+- **New:** DSP Bypass command (0x08) - skips EQ, keeps safety processing
+- **Fixed:** Bypass mode now keeps pre-gain, limiter, volume (prevents hot tracks from clipping)
+- **Fixed:** Audio Duck command handler (was logging wrong message)
+- **Fixed:** Sample rate detection for multi-bit SBC bitmasks (fallback to 44.1kHz)
+- **Updated:** GalacticStatus shieldStatus now includes Bypass (bit 4) and Bass Boost (bit 5)
+
+### v2.2.0 (2026-01-26)
+- DSP optimizations with block-based normalizer
+- Added DSP bypass mode (debug)
+- Pre-gain adjusted to -3dB
+
+### v2.1.0 (2026-01-23)
+- OTA firmware update support (BLE+WiFi hybrid)
+- GalacticStatus periodic notifications
+
+### v2.0.0 (2026-01-22)
+- Volume control with preset-based caps
+- Normalizer/DRC feature
+- Audio Duck panic button
+
+### v1.1.0 (2026-01-21)
+- Initial release with DSP presets and loudness
 
 ## License
 
