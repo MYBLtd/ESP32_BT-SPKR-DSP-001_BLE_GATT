@@ -90,9 +90,11 @@ extern "C" {
 #define DSP_CMD_SET_LOUDNESS    0x02    /* VAL: 0/1 (off/on) */
 #define DSP_CMD_GET_STATUS      0x03    /* VAL: 0 (triggers notify) */
 #define DSP_CMD_SET_MUTE        0x04    /* VAL: 0/1 (unmute/mute) */
-#define DSP_CMD_SET_AUDIO_DUCK  0x05    /* VAL: 0/1 (off/on) - FR-21: reduces volume to ~25% */
+#define DSP_CMD_SET_AUDIO_DUCK  0x05    /* VAL: 0/1 (off/on) - FR-21: panic button, reduces volume */
 #define DSP_CMD_SET_NORMALIZER  0x06    /* VAL: 0/1 (off/on) - FR-22: dynamic range compression */
 #define DSP_CMD_SET_VOLUME      0x07    /* VAL: 0-100 (volume trim) - FR-24: device volume control */
+#define DSP_CMD_SET_BYPASS      0x08    /* VAL: 0/1 (off/on) - Skip EQ, keep safety (debug) */
+#define DSP_CMD_SET_BASS_BOOST  0x09    /* VAL: 0/1 (off/on) - Bass boost (+8dB @ 100Hz) */
 
 /*
  * OTA Commands (Section 10.5)

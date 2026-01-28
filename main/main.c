@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 
 #include "esp_bt.h"
@@ -240,10 +241,18 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     case ESP_A2D_AUDIO_CFG_EVT:
         ESP_LOGI(TAG, "Audio configuration received");
         if (param->audio_cfg.mcc.type == ESP_A2D_MCT_SBC) {
-            uint32_t sample_rate = 44100;
+            uint32_t sample_rate = 44100;  /* Safe default */
             uint8_t samp_freq = param->audio_cfg.mcc.cie.sbc_info.samp_freq;
 
-            if (samp_freq & 0x01) {
+            /* Log raw value for debugging rate mismatch issues */
+            ESP_LOGI(TAG, "SBC samp_freq mask: 0x%02x", samp_freq);
+
+            /* Count bits set - if multiple bits, this is a capabilities mask, not config */
+            int bit_count = __builtin_popcount(samp_freq & 0x0F);
+            if (bit_count != 1) {
+                ESP_LOGW(TAG, "samp_freq has %d bits set (expected 1), defaulting to 44.1kHz", bit_count);
+                /* Keep default 44100 - most common and safest fallback */
+            } else if (samp_freq & 0x01) {
                 sample_rate = 48000;
             } else if (samp_freq & 0x02) {
                 sample_rate = 44100;
@@ -482,6 +491,12 @@ void app_main(void)
     ESP_LOGI(TAG, "=== ESP32 Bluetooth Speaker with DSP ===");
     ESP_LOGI(TAG, "FSD-DSP-001: DSP Presets + Loudness via BLE GATT");
     ESP_LOGI(TAG, "Firmware version: %s", ota_mgr_get_version());
+
+    /* Log heap info for AAC feasibility check */
+    ESP_LOGI(TAG, "Heap: free=%lu, largest_block=%lu, DRAM=%lu",
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
     /* Initialize NVS (required for Bluetooth and settings storage) */
     esp_err_t ret = nvs_flash_init();

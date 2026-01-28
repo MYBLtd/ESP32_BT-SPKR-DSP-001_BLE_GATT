@@ -51,8 +51,9 @@ typedef struct {
 #define DSP_FLAG_CLIPPING         (1 << 1)
 #define DSP_FLAG_THERMAL_WARN     (1 << 2)
 #define DSP_FLAG_MUTED            (1 << 3)
-#define DSP_FLAG_AUDIO_DUCK       (1 << 4)  /* FR-22: Audio duck (panic) active */
-#define DSP_FLAG_NORMALIZER       (1 << 5)  /* FR-23: Normalizer/DRC active */
+#define DSP_FLAG_AUDIO_DUCK       (1 << 4)  /* FR-21: Audio duck (panic) active */
+#define DSP_FLAG_NORMALIZER       (1 << 5)  /* FR-22: Normalizer/DRC active */
+#define DSP_FLAG_BYPASS           (1 << 6)  /* DSP bypass mode active */
 
 /*
  * Biquad filter coefficients
@@ -98,7 +99,7 @@ typedef struct {
 #define DSP_SMOOTHING_MS        30      /* Parameter smoothing time (FR-13) */
 
 /* Global defaults (Section 8.1) */
-#define DSP_PRE_GAIN_DB         (-6.0f) /* FR-7: Headroom for EQ boosts */
+#define DSP_PRE_GAIN_DB         (-3.0f) /* FR-7: Headroom for EQ boosts */
 #define DSP_HPF_FREQ_HZ         95.0f   /* High-pass filter cutoff */
 #define DSP_HPF_Q               0.707f  /* Butterworth Q */
 
@@ -121,6 +122,11 @@ typedef struct {
 #define DSP_NORMALIZER_ATTACK_MS    7.0f    /* 5-10 ms attack */
 #define DSP_NORMALIZER_RELEASE_MS   150.0f  /* 100-200 ms release */
 #define DSP_NORMALIZER_MAKEUP_DB    6.0f    /* Makeup gain to compensate */
+
+/* Bass Boost settings */
+#define DSP_BASS_BOOST_FREQ_HZ      100.0f  /* Center frequency for bass boost */
+#define DSP_BASS_BOOST_GAIN_DB      8.0f    /* Boost amount when enabled */
+#define DSP_BASS_BOOST_SLOPE        0.7f    /* Shelf slope (similar to loudness) */
 
 /*
  * Initialize DSP processor
@@ -205,6 +211,29 @@ esp_err_t dsp_set_audio_duck(bool enabled);
 bool dsp_get_audio_duck(void);
 
 /*
+ * Set DSP bypass state
+ * Bypasses EQ/filter processing when enabled (for debugging)
+ *
+ * When bypass is enabled:
+ * - SKIPPED: HPF, Preset EQ, Loudness overlay, Normalizer/DRC
+ * - KEPT: Pre-gain (headroom), Limiter (safety), Volume trim, Audio duck, Mute
+ *
+ * This ensures hot tracks don't clip even when testing "raw" audio,
+ * since the MAX98357A/speaker can still distort without headroom.
+ *
+ * @param enabled true to enable bypass (skip EQ, keep safety)
+ * @return ESP_OK on success
+ */
+esp_err_t dsp_set_bypass(bool enabled);
+
+/*
+ * Get DSP bypass state
+ *
+ * @return true if bypass is enabled
+ */
+bool dsp_get_bypass(void);
+
+/*
  * Set normalizer state (FR-22)
  * Enables dynamic range compression when active
  * Makes quiet sounds louder and loud sounds quieter
@@ -220,6 +249,22 @@ esp_err_t dsp_set_normalizer(bool enabled);
  * @return true if normalizer is enabled
  */
 bool dsp_get_normalizer(void);
+
+/*
+ * Set bass boost state
+ * Applies a low-shelf boost at 100Hz when enabled
+ *
+ * @param enabled true to enable bass boost
+ * @return ESP_OK on success
+ */
+esp_err_t dsp_set_bass_boost(bool enabled);
+
+/*
+ * Get bass boost state
+ *
+ * @return true if bass boost is enabled
+ */
+bool dsp_get_bass_boost(void);
 
 /*
  * Set volume trim (FR-24)

@@ -60,19 +60,19 @@ typedef struct {
 
 /* Preset definitions from FSD Section 8 */
 static const eq_band_params_t preset_params[DSP_PRESET_COUNT][DSP_NUM_EQ_BANDS] = {
-    /* OFFICE (Section 8.2) */
+    /* OFFICE (Section 8.2) - Subtle enhancement for background listening */
     {
-        { 160.0f,  +1.5f, 0.7f, EQ_TYPE_LOWSHELF },
-        { 320.0f,  -1.0f, 1.0f, EQ_TYPE_PEAKING },
-        { 2800.0f, -1.5f, 1.0f, EQ_TYPE_PEAKING },
-        { 9000.0f, +0.5f, 0.7f, EQ_TYPE_HIGHSHELF }
+        { 150.0f,  +3.0f, 0.7f, EQ_TYPE_LOWSHELF },   /* Mild bass warmth */
+        { 350.0f,  -1.5f, 1.0f, EQ_TYPE_PEAKING },    /* Reduce boxiness */
+        { 3000.0f, +1.0f, 1.0f, EQ_TYPE_PEAKING },    /* Slight clarity */
+        { 9000.0f, +2.0f, 0.7f, EQ_TYPE_HIGHSHELF }   /* Subtle brightness */
     },
-    /* FULL (Section 8.3) */
+    /* FULL (Section 8.3) - Aggressive bass and treble for small speakers */
     {
-        { 140.0f,  +4.0f, 0.8f, EQ_TYPE_LOWSHELF },
-        { 420.0f,  -1.5f, 1.0f, EQ_TYPE_PEAKING },
-        { 3200.0f, +0.7f, 1.0f, EQ_TYPE_PEAKING },
-        { 9500.0f, +1.5f, 0.7f, EQ_TYPE_HIGHSHELF }
+        { 100.0f,  +9.0f, 0.7f, EQ_TYPE_LOWSHELF },   /* Deep bass boost */
+        { 300.0f,  -2.0f, 1.0f, EQ_TYPE_PEAKING },    /* Reduce mud */
+        { 3500.0f, +3.0f, 1.2f, EQ_TYPE_PEAKING },    /* Presence boost */
+        { 10000.0f, +5.0f, 0.7f, EQ_TYPE_HIGHSHELF }  /* Air/sparkle */
     },
     /* NIGHT (Section 8.4) */
     {
@@ -90,10 +90,10 @@ static const eq_band_params_t preset_params[DSP_PRESET_COUNT][DSP_NUM_EQ_BANDS] 
     }
 };
 
-/* Loudness overlay parameters (Section 9.1) - Aggressive loudness curve */
+/* Loudness overlay parameters (Section 9.1) - Very aggressive loudness curve */
 static const eq_band_params_t loudness_params[DSP_NUM_LOUDNESS_BANDS] = {
-    { 120.0f,  +6.0f, 0.7f, EQ_TYPE_LOWSHELF },   /* Deep bass boost */
-    { 10000.0f, +3.0f, 0.6f, EQ_TYPE_HIGHSHELF }  /* Brighter treble */
+    { 80.0f,   +12.0f, 0.6f, EQ_TYPE_LOWSHELF },  /* Maximum bass boost */
+    { 12000.0f, +6.0f, 0.5f, EQ_TYPE_HIGHSHELF }  /* Crisp treble boost */
 };
 
 /* Preset names */
@@ -144,6 +144,17 @@ typedef struct {
     bool audio_duck_enabled;
     float audio_duck_gain;
     float audio_duck_gain_target;
+
+    /* DSP Bypass - skip all processing for debugging */
+    bool bypass_enabled;
+
+    /* Bass Boost - low-shelf boost at 100Hz */
+    bool bass_boost_enabled;
+    biquad_coeffs_t bass_boost_coeffs;
+    biquad_coeffs_t bass_boost_target;
+    biquad_state_t bass_boost_state[2];     /* L/R */
+    float bass_boost_gain;                   /* 0.0 = off, 1.0 = on (for crossfade) */
+    float bass_boost_gain_target;
 
     /* Volume Trim (FR-24) - device-side volume control */
     uint8_t volume_trim;            /* User-set volume (0-100) */
@@ -374,6 +385,10 @@ static void update_filters(dsp_state_t *dsp)
         calc_eq_band(&dsp->loudness_target[i], &loudness_params[i], fs);
     }
 
+    /* Bass boost (low-shelf at 100Hz) */
+    calc_biquad_lowshelf(&dsp->bass_boost_target, DSP_BASS_BOOST_FREQ_HZ,
+                         DSP_BASS_BOOST_GAIN_DB, DSP_BASS_BOOST_SLOPE, fs);
+
     /* Limiter */
     calc_limiter_coeffs(dsp);
 
@@ -415,6 +430,11 @@ esp_err_t dsp_init(uint32_t sample_rate)
     s_dsp.audio_duck_gain = 1.0f;
     s_dsp.audio_duck_gain_target = 1.0f;
 
+    /* Initialize Bass Boost */
+    s_dsp.bass_boost_enabled = false;
+    s_dsp.bass_boost_gain = 0.0f;
+    s_dsp.bass_boost_gain_target = 0.0f;
+
     /* Initialize Volume Trim (FR-24) */
     s_dsp.volume_trim = DSP_VOLUME_TRIM_DEFAULT;
     s_dsp.volume_gain = 1.0f;
@@ -440,6 +460,7 @@ esp_err_t dsp_init(uint32_t sample_rate)
     for (int i = 0; i < DSP_NUM_LOUDNESS_BANDS; i++) {
         calc_biquad_bypass(&s_dsp.loudness_coeffs[i]);
     }
+    calc_biquad_bypass(&s_dsp.bass_boost_coeffs);  /* Start with bypass */
 
     /* Reset all filter states */
     for (int ch = 0; ch < 2; ch++) {
@@ -450,6 +471,7 @@ esp_err_t dsp_init(uint32_t sample_rate)
         for (int i = 0; i < DSP_NUM_LOUDNESS_BANDS; i++) {
             reset_biquad_state(&s_dsp.loudness_state[i][ch]);
         }
+        reset_biquad_state(&s_dsp.bass_boost_state[ch]);
     }
 
     s_dsp.initialized = true;
@@ -486,6 +508,7 @@ esp_err_t dsp_set_sample_rate(uint32_t sample_rate)
         for (int i = 0; i < DSP_NUM_LOUDNESS_BANDS; i++) {
             reset_biquad_state(&s_dsp.loudness_state[i][ch]);
         }
+        reset_biquad_state(&s_dsp.bass_boost_state[ch]);
     }
 
     return ESP_OK;
@@ -580,11 +603,10 @@ esp_err_t dsp_set_audio_duck(bool enabled)
         return ESP_OK;
     }
 
-    /* Audio Duck is now repurposed as DSP BYPASS mode for debugging */
-    ESP_LOGI(TAG, "Setting DSP BYPASS: %s", enabled ? "ON (no processing)" : "OFF (normal DSP)");
+    /* Audio Duck (FR-21): Panic button volume reduction */
+    ESP_LOGI(TAG, "Setting Audio Duck: %s", enabled ? "ON (volume reduced)" : "OFF");
     s_dsp.audio_duck_enabled = enabled;
-    /* Keep gain at 1.0 - bypass just skips processing, doesn't change volume */
-    s_dsp.audio_duck_gain_target = 1.0f;
+    s_dsp.audio_duck_gain_target = enabled ? DB_TO_LINEAR(DSP_AUDIO_DUCK_GAIN_DB) : 1.0f;
 
     return ESP_OK;
 }
@@ -592,6 +614,31 @@ esp_err_t dsp_set_audio_duck(bool enabled)
 bool dsp_get_audio_duck(void)
 {
     return s_dsp.audio_duck_enabled;
+}
+
+esp_err_t dsp_set_bypass(bool enabled)
+{
+    if (!s_dsp.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (enabled == s_dsp.bypass_enabled) {
+        return ESP_OK;
+    }
+
+    /* Bypass mode skips: HPF, Preset EQ, Loudness, Normalizer
+     * Bypass mode KEEPS: Pre-gain (headroom), Limiter (safety), Volume, Duck, Mute
+     * This prevents hot tracks from clipping even when testing "raw" audio */
+    ESP_LOGI(TAG, "Setting DSP Bypass: %s (pre-gain/limiter/volume still active)",
+             enabled ? "ON" : "OFF");
+    s_dsp.bypass_enabled = enabled;
+
+    return ESP_OK;
+}
+
+bool dsp_get_bypass(void)
+{
+    return s_dsp.bypass_enabled;
 }
 
 esp_err_t dsp_set_normalizer(bool enabled)
@@ -623,6 +670,28 @@ esp_err_t dsp_set_normalizer(bool enabled)
 bool dsp_get_normalizer(void)
 {
     return s_dsp.normalizer_enabled;
+}
+
+esp_err_t dsp_set_bass_boost(bool enabled)
+{
+    if (!s_dsp.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (enabled == s_dsp.bass_boost_enabled) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Setting bass boost: %s", enabled ? "ON (+8dB @ 100Hz)" : "OFF");
+    s_dsp.bass_boost_enabled = enabled;
+    s_dsp.bass_boost_gain_target = enabled ? 1.0f : 0.0f;
+
+    return ESP_OK;
+}
+
+bool dsp_get_bass_boost(void)
+{
+    return s_dsp.bass_boost_enabled;
 }
 
 uint8_t dsp_get_volume_cap(void)
@@ -706,6 +775,10 @@ void dsp_get_status(dsp_status_t *status)
         status->flags |= DSP_FLAG_NORMALIZER;
     }
 
+    if (s_dsp.bypass_enabled) {
+        status->flags |= DSP_FLAG_BYPASS;
+    }
+
     if (s_dsp.clipping_detected) {
         status->flags |= DSP_FLAG_CLIPPING;
         s_dsp.clipping_detected = false;  /* Clear after read */
@@ -729,18 +802,13 @@ void dsp_process(int16_t *samples, uint32_t num_samples)
         return;
     }
 
-    /* BYPASS MODE: Skip all DSP processing when audio_duck (bypass) is enabled */
-    if (s_dsp.audio_duck_enabled) {
-        /* Pass audio through unchanged - useful for debugging */
-        return;
-    }
-
     /* Process stereo interleaved samples */
     uint32_t num_frames = num_samples / 2;
 
-    /* Block-based normalizer: find peak of entire buffer first (optimization) */
+    /* Block-based normalizer: find peak of entire buffer first (optimization)
+     * Skip if bypass mode is enabled (normalizer is bypassed) */
     float block_peak = 0.0f;
-    if (s_dsp.normalizer_enabled) {
+    if (s_dsp.normalizer_enabled && !s_dsp.bypass_enabled) {
         for (uint32_t i = 0; i < num_frames; i++) {
             float l = fabsf(INT16_TO_FLOAT(samples[i * 2]));
             float r = fabsf(INT16_TO_FLOAT(samples[i * 2 + 1]));
@@ -756,77 +824,100 @@ void dsp_process(int16_t *samples, uint32_t num_samples)
         float left = INT16_TO_FLOAT(samples[i * 2]);
         float right = INT16_TO_FLOAT(samples[i * 2 + 1]);
 
-        /* Apply pre-gain (FR-7) */
+        /* Apply pre-gain (FR-7) - ALWAYS applied, even in bypass mode
+         * This provides headroom to prevent downstream clipping */
         s_dsp.pre_gain += s_dsp.smooth_coeff * (s_dsp.pre_gain_target - s_dsp.pre_gain);
         left *= s_dsp.pre_gain;
         right *= s_dsp.pre_gain;
 
-        /* High-pass filter (protection) */
-        left = biquad_process(&s_dsp.hpf_coeffs, &s_dsp.hpf_state[0], left);
-        right = biquad_process(&s_dsp.hpf_coeffs, &s_dsp.hpf_state[1], right);
+        /* BYPASS MODE: Skip EQ/filters but keep safety processing (pre-gain, limiter, volume) */
+        if (!s_dsp.bypass_enabled) {
+            /* High-pass filter (protection) */
+            left = biquad_process(&s_dsp.hpf_coeffs, &s_dsp.hpf_state[0], left);
+            right = biquad_process(&s_dsp.hpf_coeffs, &s_dsp.hpf_state[1], right);
 
-        /* Preset EQ (with coefficient smoothing) */
-        for (int b = 0; b < DSP_NUM_EQ_BANDS; b++) {
-            /* Smooth coefficients toward target */
-            interpolate_coeffs(&s_dsp.eq_coeffs[b], &s_dsp.eq_coeffs[b],
-                             &s_dsp.eq_target[b], s_dsp.smooth_coeff);
+            /* Preset EQ (with coefficient smoothing) */
+            for (int b = 0; b < DSP_NUM_EQ_BANDS; b++) {
+                /* Smooth coefficients toward target */
+                interpolate_coeffs(&s_dsp.eq_coeffs[b], &s_dsp.eq_coeffs[b],
+                                 &s_dsp.eq_target[b], s_dsp.smooth_coeff);
 
-            left = biquad_process(&s_dsp.eq_coeffs[b], &s_dsp.eq_state[b][0], left);
-            right = biquad_process(&s_dsp.eq_coeffs[b], &s_dsp.eq_state[b][1], right);
-        }
-
-        /* Loudness overlay (FR-9) - crossfade based on loudness_gain */
-        s_dsp.loudness_gain += s_dsp.smooth_coeff * (s_dsp.loudness_gain_target - s_dsp.loudness_gain);
-
-        if (s_dsp.loudness_gain > 0.001f) {
-            /* Apply loudness filters and blend */
-            float loud_left = left;
-            float loud_right = right;
-
-            for (int b = 0; b < DSP_NUM_LOUDNESS_BANDS; b++) {
-                /* Update loudness coefficients toward target */
-                interpolate_coeffs(&s_dsp.loudness_coeffs[b], &s_dsp.loudness_coeffs[b],
-                                 &s_dsp.loudness_target[b], s_dsp.smooth_coeff);
-
-                loud_left = biquad_process(&s_dsp.loudness_coeffs[b],
-                                          &s_dsp.loudness_state[b][0], loud_left);
-                loud_right = biquad_process(&s_dsp.loudness_coeffs[b],
-                                           &s_dsp.loudness_state[b][1], loud_right);
+                left = biquad_process(&s_dsp.eq_coeffs[b], &s_dsp.eq_state[b][0], left);
+                right = biquad_process(&s_dsp.eq_coeffs[b], &s_dsp.eq_state[b][1], right);
             }
 
-            /* Crossfade between dry and loudness-processed */
-            left = left * (1.0f - s_dsp.loudness_gain) + loud_left * s_dsp.loudness_gain;
-            right = right * (1.0f - s_dsp.loudness_gain) + loud_right * s_dsp.loudness_gain;
-        }
+            /* Loudness overlay (FR-9) - crossfade based on loudness_gain */
+            s_dsp.loudness_gain += s_dsp.smooth_coeff * (s_dsp.loudness_gain_target - s_dsp.loudness_gain);
 
-        /* Normalizer/DRC (FR-22) - block-based dynamic range compression
-         * Uses block peak (calculated once per buffer) for envelope tracking
-         * to reduce CPU load. Gain is still applied per-sample for smoothness. */
-        if (s_dsp.normalizer_enabled) {
-            /* Update envelope using block peak (much cheaper than per-sample) */
-            if (block_peak > s_dsp.normalizer_envelope) {
-                s_dsp.normalizer_envelope += s_dsp.normalizer_attack_coeff *
-                                            (block_peak - s_dsp.normalizer_envelope);
-            } else {
-                s_dsp.normalizer_envelope += s_dsp.normalizer_release_coeff *
-                                            (block_peak - s_dsp.normalizer_envelope);
+            if (s_dsp.loudness_gain > 0.001f) {
+                /* Apply loudness filters and blend */
+                float loud_left = left;
+                float loud_right = right;
+
+                for (int b = 0; b < DSP_NUM_LOUDNESS_BANDS; b++) {
+                    /* Update loudness coefficients toward target */
+                    interpolate_coeffs(&s_dsp.loudness_coeffs[b], &s_dsp.loudness_coeffs[b],
+                                     &s_dsp.loudness_target[b], s_dsp.smooth_coeff);
+
+                    loud_left = biquad_process(&s_dsp.loudness_coeffs[b],
+                                              &s_dsp.loudness_state[b][0], loud_left);
+                    loud_right = biquad_process(&s_dsp.loudness_coeffs[b],
+                                               &s_dsp.loudness_state[b][1], loud_right);
+                }
+
+                /* Crossfade between dry and loudness-processed */
+                left = left * (1.0f - s_dsp.loudness_gain) + loud_left * s_dsp.loudness_gain;
+                right = right * (1.0f - s_dsp.loudness_gain) + loud_right * s_dsp.loudness_gain;
             }
 
-            /* Calculate compression gain (only when above threshold) */
-            if (s_dsp.normalizer_envelope > s_dsp.normalizer_threshold) {
-                float over_threshold = s_dsp.normalizer_envelope / s_dsp.normalizer_threshold;
-                float compressed = fast_powf_approx(over_threshold, 1.0f - 1.0f / s_dsp.normalizer_ratio);
-                s_dsp.normalizer_gain = 1.0f / compressed;
-            } else {
-                s_dsp.normalizer_gain = 1.0f;
+            /* Bass Boost - low-shelf boost at 100Hz with crossfade */
+            s_dsp.bass_boost_gain += s_dsp.smooth_coeff * (s_dsp.bass_boost_gain_target - s_dsp.bass_boost_gain);
+
+            if (s_dsp.bass_boost_gain > 0.001f) {
+                /* Apply bass boost filter and blend */
+                interpolate_coeffs(&s_dsp.bass_boost_coeffs, &s_dsp.bass_boost_coeffs,
+                                 &s_dsp.bass_boost_target, s_dsp.smooth_coeff);
+
+                float boost_left = biquad_process(&s_dsp.bass_boost_coeffs,
+                                                 &s_dsp.bass_boost_state[0], left);
+                float boost_right = biquad_process(&s_dsp.bass_boost_coeffs,
+                                                  &s_dsp.bass_boost_state[1], right);
+
+                /* Crossfade between dry and bass-boosted */
+                left = left * (1.0f - s_dsp.bass_boost_gain) + boost_left * s_dsp.bass_boost_gain;
+                right = right * (1.0f - s_dsp.bass_boost_gain) + boost_right * s_dsp.bass_boost_gain;
             }
 
-            /* Apply compression gain and makeup gain */
-            left *= s_dsp.normalizer_gain * s_dsp.normalizer_makeup_gain;
-            right *= s_dsp.normalizer_gain * s_dsp.normalizer_makeup_gain;
-        }
+            /* Normalizer/DRC (FR-22) - block-based dynamic range compression
+             * Uses block peak (calculated once per buffer) for envelope tracking
+             * to reduce CPU load. Gain is still applied per-sample for smoothness. */
+            if (s_dsp.normalizer_enabled) {
+                /* Update envelope using block peak (much cheaper than per-sample) */
+                if (block_peak > s_dsp.normalizer_envelope) {
+                    s_dsp.normalizer_envelope += s_dsp.normalizer_attack_coeff *
+                                                (block_peak - s_dsp.normalizer_envelope);
+                } else {
+                    s_dsp.normalizer_envelope += s_dsp.normalizer_release_coeff *
+                                                (block_peak - s_dsp.normalizer_envelope);
+                }
 
-        /* Limiter (FR-11) - soft-knee peak limiter */
+                /* Calculate compression gain (only when above threshold) */
+                if (s_dsp.normalizer_envelope > s_dsp.normalizer_threshold) {
+                    float over_threshold = s_dsp.normalizer_envelope / s_dsp.normalizer_threshold;
+                    float compressed = fast_powf_approx(over_threshold, 1.0f - 1.0f / s_dsp.normalizer_ratio);
+                    s_dsp.normalizer_gain = 1.0f / compressed;
+                } else {
+                    s_dsp.normalizer_gain = 1.0f;
+                }
+
+                /* Apply compression gain and makeup gain */
+                left *= s_dsp.normalizer_gain * s_dsp.normalizer_makeup_gain;
+                right *= s_dsp.normalizer_gain * s_dsp.normalizer_makeup_gain;
+            }
+        } /* end if (!bypass_enabled) */
+
+        /* Limiter (FR-11) - soft-knee peak limiter
+         * ALWAYS active, even in bypass mode - prevents downstream clipping */
         float peak = fmaxf(fabsf(left), fabsf(right));
 
         /* Update envelope (attack/release) */
@@ -858,17 +949,20 @@ void dsp_process(int16_t *samples, uint32_t num_samples)
             right = fmaxf(-1.0f, fminf(1.0f, right));
         }
 
-        /* Volume Trim (FR-24) - device-side volume control */
+        /* Volume Trim (FR-24) - device-side volume control
+         * ALWAYS applied, even in bypass mode */
         s_dsp.volume_gain += s_dsp.smooth_coeff * (s_dsp.volume_gain_target - s_dsp.volume_gain);
         left *= s_dsp.volume_gain;
         right *= s_dsp.volume_gain;
 
-        /* Audio Duck (FR-21) - smooth volume reduction for panic button */
+        /* Audio Duck (FR-21) - smooth volume reduction for panic button
+         * ALWAYS applied, even in bypass mode */
         s_dsp.audio_duck_gain += s_dsp.smooth_coeff * (s_dsp.audio_duck_gain_target - s_dsp.audio_duck_gain);
         left *= s_dsp.audio_duck_gain;
         right *= s_dsp.audio_duck_gain;
 
-        /* Apply mute with smooth fade */
+        /* Apply mute with smooth fade
+         * ALWAYS applied, even in bypass mode */
         s_dsp.mute_gain += s_dsp.smooth_coeff * (s_dsp.mute_gain_target - s_dsp.mute_gain);
         left *= s_dsp.mute_gain;
         right *= s_dsp.mute_gain;

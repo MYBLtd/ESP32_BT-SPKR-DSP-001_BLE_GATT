@@ -21,7 +21,7 @@
 static const char *TAG = "OTA_MGR";
 
 /* Firmware version */
-#define FIRMWARE_VERSION    "3.0.0"
+#define FIRMWARE_VERSION    "2.3.0"
 
 /* OTA task configuration */
 #define OTA_TASK_STACK_SIZE     8192
