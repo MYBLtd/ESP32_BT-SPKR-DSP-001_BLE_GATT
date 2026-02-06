@@ -139,9 +139,14 @@ extern "C" {
 /*
  * BLE advertising configuration
  */
-#define BLE_DEVICE_NAME         "42 Decibels"
 #define BLE_ADV_INTERVAL_MIN    0x20    /* 20ms */
 #define BLE_ADV_INTERVAL_MAX    0x40    /* 40ms */
+
+/*
+ * Get the device name (with MAC suffix for unique identification)
+ * Defined in main.c, shared between Classic BT and BLE
+ */
+extern const char *bt_get_device_name(void);
 
 /*
  * Callback function type for settings changes
