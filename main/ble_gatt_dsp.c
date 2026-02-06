@@ -17,6 +17,18 @@
 #include "esp_bt_main.h"
 #include "esp_timer.h"
 #include "freertos/timers.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+
+/* UART configuration for serial echo
+ * Note: GPIO16/17 are used by PSRAM on ESP32-WROVER modules!
+ * Note: GPIO25/26 are used by I2S (WS/BCK)
+ * Using GPIO4 (TX) and GPIO5 (RX) which are free */
+#define UART_ECHO_PORT      UART_NUM_2
+#define UART_ECHO_TX_PIN    GPIO_NUM_4
+#define UART_ECHO_RX_PIN    GPIO_NUM_5
+#define UART_ECHO_BAUD      115200
+#define UART_ECHO_BUF_SIZE  256
 
 static const char *TAG = "BLE_GATT";
 
@@ -363,6 +375,9 @@ static ble_state_t s_ble = {
     .settings_cb = NULL,
 };
 
+/* UART echo state */
+static bool s_uart_echo_initialized = false;
+
 /* Forward declarations */
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
@@ -371,6 +386,74 @@ static void handle_control_write(const uint8_t *data, uint16_t len);
 static void update_status_value(void);
 static void update_galactic_status_value(void);
 static void galactic_notify_timer_callback(TimerHandle_t timer);
+static esp_err_t uart_echo_init(void);
+static void uart_echo_gatt_command(const char *char_name, const uint8_t *data, uint16_t len);
+
+/*
+ * Initialize UART for serial echo of BLE GATT commands
+ */
+static esp_err_t uart_echo_init(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = UART_ECHO_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    esp_err_t ret = uart_driver_install(UART_ECHO_PORT, UART_ECHO_BUF_SIZE, 0, 0, NULL, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = uart_param_config(UART_ECHO_PORT, &uart_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UART param config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = uart_set_pin(UART_ECHO_PORT, UART_ECHO_TX_PIN, UART_ECHO_RX_PIN,
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UART set pin failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_uart_echo_initialized = true;
+    ESP_LOGI(TAG, "UART echo initialized on TX=GPIO%d, RX=GPIO%d @ %d baud",
+             UART_ECHO_TX_PIN, UART_ECHO_RX_PIN, UART_ECHO_BAUD);
+    return ESP_OK;
+}
+
+/*
+ * Echo BLE GATT command to serial port
+ * Format: "GATT:<char_name>:<hex_bytes>\r\n"
+ */
+static void uart_echo_gatt_command(const char *char_name, const uint8_t *data, uint16_t len)
+{
+    if (!s_uart_echo_initialized || data == NULL || len == 0) {
+        return;
+    }
+
+    /* Build message: "GATT:<char_name>:" + hex bytes + "\r\n" */
+    char msg[128];
+    int offset = snprintf(msg, sizeof(msg), "GATT:%s:", char_name);
+
+    /* Append hex bytes */
+    for (uint16_t i = 0; i < len && offset < (int)(sizeof(msg) - 4); i++) {
+        offset += snprintf(msg + offset, sizeof(msg) - offset, "%02X", data[i]);
+    }
+
+    /* Append newline */
+    offset += snprintf(msg + offset, sizeof(msg) - offset, "\r\n");
+
+    /* Send to UART */
+    int written = uart_write_bytes(UART_ECHO_PORT, msg, offset);
+    ESP_LOGI(TAG, "UART echo: %s (wrote %d bytes)", msg, written);
+}
 
 /*
  * GAP event handler
@@ -609,8 +692,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             ESP_LOGI(TAG, "GATT app registered, app_id=%d", param->reg.app_id);
             s_ble.gatts_if = gatts_if;
 
-            /* Set device name for BLE */
-            esp_ble_gap_set_device_name(BLE_DEVICE_NAME);
+            /* Set device name for BLE (uses shared name with MAC suffix) */
+            esp_ble_gap_set_device_name(bt_get_device_name());
 
             /* Configure advertising data */
             esp_ble_gap_config_adv_data(&adv_data);
@@ -700,6 +783,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         if (!param->write.is_prep) {
             /* Handle write to control characteristic */
             if (param->write.handle == s_ble.handle_table[IDX_CTRL_VAL]) {
+                uart_echo_gatt_command("CTRL", param->write.value, param->write.len);
                 handle_control_write(param->write.value, param->write.len);
 
                 /* Send response if needed */
@@ -710,6 +794,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             }
             /* Handle write to status CCC (enable/disable notifications) */
             else if (param->write.handle == s_ble.handle_table[IDX_STATUS_CCC]) {
+                uart_echo_gatt_command("STATUS_CCC", param->write.value, param->write.len);
                 if (param->write.len == 2) {
                     uint16_t ccc_val = param->write.value[0] | (param->write.value[1] << 8);
                     s_ble.notifications_enabled = (ccc_val == 0x0001);
@@ -719,6 +804,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             }
             /* Handle write to GalacticStatus CCC (enable/disable notifications) */
             else if (param->write.handle == s_ble.handle_table[IDX_GALACTIC_CCC]) {
+                uart_echo_gatt_command("GALACTIC_CCC", param->write.value, param->write.len);
                 if (param->write.len == 2) {
                     uint16_t ccc_val = param->write.value[0] | (param->write.value[1] << 8);
                     s_ble.galactic_notifications_enabled = (ccc_val == 0x0001);
@@ -728,6 +814,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             }
             /* Handle write to OTA Credentials characteristic */
             else if (param->write.handle == s_ble.handle_table[IDX_OTA_CREDS_VAL]) {
+                uart_echo_gatt_command("OTA_CREDS", param->write.value, param->write.len);
                 ESP_LOGI(TAG, "OTA credentials received, len=%d", param->write.len);
                 ota_mgr_set_credentials(param->write.value, param->write.len);
                 if (param->write.need_rsp) {
@@ -737,6 +824,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             }
             /* Handle write to OTA URL characteristic */
             else if (param->write.handle == s_ble.handle_table[IDX_OTA_URL_VAL]) {
+                uart_echo_gatt_command("OTA_URL", param->write.value, param->write.len);
                 ESP_LOGI(TAG, "OTA URL received, len=%d", param->write.len);
                 ota_mgr_set_url(param->write.value, param->write.len);
                 if (param->write.need_rsp) {
@@ -746,6 +834,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             }
             /* Handle write to OTA Control characteristic */
             else if (param->write.handle == s_ble.handle_table[IDX_OTA_CTRL_VAL]) {
+                uart_echo_gatt_command("OTA_CTRL", param->write.value, param->write.len);
                 if (param->write.len >= 1) {
                     uint8_t cmd = param->write.value[0];
                     uint8_t val = (param->write.len >= 2) ? param->write.value[1] : 0;
@@ -759,6 +848,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             }
             /* Handle write to OTA Status CCC (enable/disable notifications) */
             else if (param->write.handle == s_ble.handle_table[IDX_OTA_STATUS_CCC]) {
+                uart_echo_gatt_command("OTA_STATUS_CCC", param->write.value, param->write.len);
                 if (param->write.len == 2) {
                     uint16_t ccc_val = param->write.value[0] | (param->write.value[1] << 8);
                     s_ble.ota_notifications_enabled = (ccc_val == 0x0001);
@@ -795,6 +885,13 @@ esp_err_t ble_gatt_dsp_init(ble_dsp_settings_cb_t settings_changed_cb)
 
     s_ble.settings_cb = settings_changed_cb;
 
+    /* Initialize UART for serial echo of GATT commands */
+    esp_err_t ret = uart_echo_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "UART echo init failed (non-fatal): %s", esp_err_to_name(ret));
+        /* Continue without serial echo - not critical for operation */
+    }
+
     /* Create GalacticStatus notification timer (FR-20: 2x per second) */
     s_ble.galactic_notify_timer = xTimerCreate(
         "galactic_notify",
@@ -809,7 +906,7 @@ esp_err_t ble_gatt_dsp_init(ble_dsp_settings_cb_t settings_changed_cb)
     }
 
     /* Register GAP callback */
-    esp_err_t ret = esp_ble_gap_register_callback(gap_event_handler);
+    ret = esp_ble_gap_register_callback(gap_event_handler);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "GAP callback register failed: %s", esp_err_to_name(ret));
         return ret;

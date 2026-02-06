@@ -6,6 +6,20 @@
  * Date: 2026-01-20
  */
 
+/*
+ * V2 DEVELOPMENT MODE
+ * ====================
+ * Set to 1 for external DSP development (V2 hardware)
+ * When enabled:
+ * - ALL DSP processing is permanently bypassed (pure passthrough)
+ * - No pre-gain, no EQ, no limiter, no volume control
+ * - BLE commands are still received/logged but DSP settings are ignored
+ * - Audio passes through unchanged for external DSP processing
+ *
+ * Set to 0 for normal operation (V1 hardware with internal DSP)
+ */
+#define CONFIG_DSP_V2_DEV_BYPASS  1
+
 #include "dsp_processor.h"
 #include <string.h>
 #include <math.h>
@@ -408,6 +422,11 @@ esp_err_t dsp_init(uint32_t sample_rate)
 {
     ESP_LOGI(TAG, "Initializing DSP at %lu Hz", sample_rate);
 
+#if CONFIG_DSP_V2_DEV_BYPASS
+    ESP_LOGW(TAG, "*** V2 DEVELOPMENT MODE ACTIVE ***");
+    ESP_LOGW(TAG, "*** ALL DSP PROCESSING BYPASSED - PURE PASSTHROUGH ***");
+#endif
+
     /* Clear state */
     memset(&s_dsp, 0, sizeof(s_dsp));
 
@@ -802,6 +821,14 @@ void dsp_process(int16_t *samples, uint32_t num_samples)
         return;
     }
 
+#if CONFIG_DSP_V2_DEV_BYPASS
+    /* V2 Development Mode: Complete passthrough - no processing at all
+     * Audio passes through unchanged for external DSP processing */
+    (void)samples;  /* Suppress unused warning */
+    (void)num_samples;
+    return;
+#endif
+
     /* Process stereo interleaved samples */
     uint32_t num_frames = num_samples / 2;
 
@@ -978,6 +1005,14 @@ void dsp_process_float(float *left, float *right, uint32_t num_frames)
     if (!s_dsp.initialized || left == NULL || right == NULL || num_frames == 0) {
         return;
     }
+
+#if CONFIG_DSP_V2_DEV_BYPASS
+    /* V2 Development Mode: Complete passthrough */
+    (void)left;
+    (void)right;
+    (void)num_frames;
+    return;
+#endif
 
     for (uint32_t i = 0; i < num_frames; i++) {
         float l = left[i];

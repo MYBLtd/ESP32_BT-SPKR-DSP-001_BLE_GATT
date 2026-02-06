@@ -45,8 +45,12 @@
 
 static const char *TAG = "BT_SPEAKER";
 
-/* Device name visible on Bluetooth */
-#define BT_DEVICE_NAME "42 Decibels"
+/* Device name base - will be appended with MAC suffix */
+#define BT_DEVICE_NAME_BASE "42 Decibels"
+#define BT_DEVICE_NAME_MAX_LEN 32
+
+/* Dynamic device name with MAC suffix (e.g., "42 Decibels-A7B3") */
+static char s_device_name[BT_DEVICE_NAME_MAX_LEN] = BT_DEVICE_NAME_BASE;
 
 /* I2S GPIO Configuration for MAX98357A */
 #define I2S_BCK_PIN     GPIO_NUM_26
@@ -343,6 +347,30 @@ static void bt_app_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param
 }
 
 /*
+ * Build device name with MAC address suffix for unique identification
+ * Format: "42 Decibels-XXXX" where XXXX is last 4 hex chars of MAC
+ */
+static void build_device_name(void)
+{
+    const uint8_t *mac = esp_bt_dev_get_address();
+    if (mac != NULL) {
+        snprintf(s_device_name, BT_DEVICE_NAME_MAX_LEN, "%s-%02X%02X",
+                 BT_DEVICE_NAME_BASE, mac[4], mac[5]);
+        ESP_LOGI(TAG, "Device name: %s", s_device_name);
+    } else {
+        ESP_LOGW(TAG, "MAC address not available, using base name");
+    }
+}
+
+/*
+ * Get the device name (for use by BLE module)
+ */
+const char *bt_get_device_name(void)
+{
+    return s_device_name;
+}
+
+/*
  * Callback when DSP settings change via BLE (for NVS persistence)
  */
 static void settings_changed_callback(void)
@@ -398,8 +426,11 @@ static esp_err_t bluetooth_init(void)
         return ret;
     }
 
+    /* Build unique device name with MAC suffix */
+    build_device_name();
+
     /* Set device name */
-    esp_bt_gap_set_device_name(BT_DEVICE_NAME);
+    esp_bt_gap_set_device_name(s_device_name);
 
     /* Register GAP callback for pairing (Classic BT) */
     esp_bt_gap_register_callback(bt_app_gap_cb);
@@ -449,7 +480,7 @@ static esp_err_t bluetooth_init(void)
     /* Set discoverable and connectable mode for Classic BT */
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 
-    ESP_LOGI(TAG, "Classic Bluetooth initialized, device name: %s", BT_DEVICE_NAME);
+    ESP_LOGI(TAG, "Classic Bluetooth initialized, device name: %s", s_device_name);
 
     /* Initialize BLE GATT DSP control service */
     ret = ble_gatt_dsp_init(settings_changed_callback);
