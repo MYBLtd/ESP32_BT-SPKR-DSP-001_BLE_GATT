@@ -72,6 +72,9 @@ static i2s_chan_handle_t i2s_tx_handle = NULL;
 static bool s_a2dp_connected = false;
 static bool s_audio_started = false;
 
+/* Remote device address for RSSI reading */
+static esp_bd_addr_t s_remote_bda = {0};
+
 /* Current sample rate for DSP */
 static uint32_t s_current_sample_rate = I2S_SAMPLE_RATE;
 
@@ -209,6 +212,25 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
         ESP_LOGD(TAG, "Power mode changed: %d", param->mode_chg.mode);
         break;
 
+    case ESP_BT_GAP_READ_RSSI_DELTA_EVT:
+        if (param->read_rssi_delta.stat == ESP_BT_STATUS_SUCCESS) {
+            int8_t delta = param->read_rssi_delta.rssi_delta;
+            const char *quality;
+            if (delta >= 0) {
+                quality = "Excellent";
+            } else if (delta >= -5) {
+                quality = "Good";
+            } else if (delta >= -15) {
+                quality = "Fair";
+            } else {
+                quality = "Poor";
+            }
+            ESP_LOGI(TAG, "BT signal: delta=%d (%s)", delta, quality);
+        } else {
+            ESP_LOGD(TAG, "RSSI read failed, status: %d", param->read_rssi_delta.stat);
+        }
+        break;
+
     default:
         ESP_LOGD(TAG, "GAP event: %d", event);
         break;
@@ -223,7 +245,11 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     switch (event) {
     case ESP_A2D_CONNECTION_STATE_EVT:
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-            ESP_LOGI(TAG, "A2DP connected");
+            ESP_LOGI(TAG, "A2DP connected to %02x:%02x:%02x:%02x:%02x:%02x",
+                     param->conn_stat.remote_bda[0], param->conn_stat.remote_bda[1],
+                     param->conn_stat.remote_bda[2], param->conn_stat.remote_bda[3],
+                     param->conn_stat.remote_bda[4], param->conn_stat.remote_bda[5]);
+            memcpy(s_remote_bda, param->conn_stat.remote_bda, sizeof(esp_bd_addr_t));
             s_a2dp_connected = true;
         } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             ESP_LOGI(TAG, "A2DP disconnected");
@@ -266,7 +292,24 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 sample_rate = 16000;
             }
 
-            ESP_LOGI(TAG, "SBC codec, sample rate: %lu Hz", sample_rate);
+            /* Log SBC codec quality details */
+            const char *ch_mode_str[] = {"Mono", "Dual Channel", "Stereo", "Joint Stereo"};
+            uint8_t ch_mode = param->audio_cfg.mcc.cie.sbc_info.ch_mode;
+            uint8_t bitpool = param->audio_cfg.mcc.cie.sbc_info.max_bitpool;
+            const char *mode = (ch_mode <= 3) ? ch_mode_str[ch_mode] : "Unknown";
+
+            ESP_LOGI(TAG, "SBC codec: %lu Hz, %s, bitpool=%u",
+                     sample_rate, mode, bitpool);
+
+            /* Bitpool quality indicator */
+            if (bitpool >= 51) {
+                ESP_LOGI(TAG, "SBC quality: High (bitpool %u)", bitpool);
+            } else if (bitpool >= 35) {
+                ESP_LOGI(TAG, "SBC quality: Medium (bitpool %u)", bitpool);
+            } else {
+                ESP_LOGW(TAG, "SBC quality: Low (bitpool %u)", bitpool);
+            }
+
             i2s_reconfigure(sample_rate);
         }
         break;
@@ -507,10 +550,13 @@ static void watchdog_task(void *arg)
     while (1) {
         /* Feed watchdog periodically to prevent system reset */
         esp_task_wdt_reset();
-        if (s_audio_started) {
-            /* Placeholder for streaming health monitoring */
+
+        /* Read BT RSSI when A2DP is connected */
+        if (s_a2dp_connected) {
+            esp_bt_gap_read_rssi_delta(s_remote_bda);
         }
-        vTaskDelay(pdMS_TO_TICKS(5000));
+
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 
