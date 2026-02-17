@@ -2,9 +2,7 @@
  * ESP32 A2DP Sink + BLE GATT Controller for External DSP
  * V4 Architecture: A2DP audio → I2S → STM32 DSP, BLE GATT control + UART forwarding
  *
- * Dual-core architecture:
- *   Core 0: BT controller + Bluedroid + BLE GATT + UART + OTA + NVS
- *   Core 1: I2S writer task (audio output)
+ * Core 0: BT controller + Bluedroid + A2DP + BLE GATT + I2S write + UART + OTA + NVS
  *
  * Audio path: Phone (SBC) → ESP32 A2DP sink → I2S → STM32 → PCM5102A
  * Control path: BLE GATT → UART → STM32
@@ -18,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -44,6 +43,9 @@
 #include "nvs_settings.h"
 #include "ota_manager.h"
 
+/* Uncomment to enable I2S sine test mode (bypasses all Bluetooth) */
+// #define I2S_SINE_TEST
+
 static const char *TAG = "BT_SPEAKER";
 
 /* Device name base - will be appended with MAC suffix */
@@ -62,8 +64,12 @@ static char s_device_name[BT_DEVICE_NAME_MAX_LEN] = BT_DEVICE_NAME_BASE;
 #define I2S_SAMPLE_RATE     44100
 #define I2S_BITS_PER_SAMPLE I2S_DATA_BIT_WIDTH_16BIT
 
-/* Ring buffer for A2DP → I2S decoupling (Core 0 → Core 1) */
-#define RINGBUF_SIZE    (24 * 1024)
+/* Ring buffer for A2DP → I2S decoupling */
+#define RINGBUF_SIZE        (32 * 1024)
+
+/* Pre-buffer: accumulate this much audio before starting I2S output.
+ * 44100 Hz * 2ch * 2 bytes * 0.050s = 8820 bytes ≈ 50ms */
+#define PREBUF_BYTES        8820
 
 /* Watchdog timeout in seconds */
 #define WDT_TIMEOUT_SEC     30
@@ -77,6 +83,7 @@ static RingbufHandle_t s_ringbuf = NULL;
 /* Connection state tracking */
 static bool s_a2dp_connected = false;
 static bool s_audio_started = false;
+static esp_bd_addr_t s_peer_bda = {0};
 
 /* Current sample rate */
 static uint32_t s_current_sample_rate = I2S_SAMPLE_RATE;
@@ -86,7 +93,6 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
 static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param);
 static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len);
 static void bt_app_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param);
-static void i2s_writer_task(void *arg);
 
 /*
  * Build device name with MAC address suffix for unique identification
@@ -121,7 +127,9 @@ static esp_err_t i2s_init(void)
     ESP_LOGI(TAG, "Initializing I2S...");
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.auto_clear = true;
+    chan_cfg.dma_desc_num = 8;       /* 8 DMA descriptors (default: 6) */
+    chan_cfg.dma_frame_num = 480;    /* 480 frames per descriptor (default: 240) */
+    chan_cfg.auto_clear = true;      /* Output silence on underrun */
 
     esp_err_t ret = i2s_new_channel(&chan_cfg, &i2s_tx_handle, NULL);
     if (ret != ESP_OK) {
@@ -235,7 +243,11 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
         break;
 
     case ESP_BT_GAP_MODE_CHG_EVT:
-        ESP_LOGD(TAG, "Power mode changed: %d", param->mode_chg.mode);
+        ESP_LOGI(TAG, "Power mode changed: %d (0=active, 2=sniff)", param->mode_chg.mode);
+        if (param->mode_chg.mode == ESP_BT_PM_MD_SNIFF && s_a2dp_connected) {
+            ESP_LOGW(TAG, "Sniff mode while A2DP connected — re-requesting QoS");
+            esp_bt_gap_set_qos(s_peer_bda, 40);
+        }
         break;
 
     default:
@@ -254,6 +266,9 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             ESP_LOGI(TAG, "A2DP connected");
             s_a2dp_connected = true;
+            memcpy(s_peer_bda, param->conn_stat.remote_bda, sizeof(esp_bd_addr_t));
+            /* Set low poll interval to prevent sniff mode during audio */
+            esp_bt_gap_set_qos(s_peer_bda, 40);
         } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             ESP_LOGI(TAG, "A2DP disconnected");
             s_a2dp_connected = false;
@@ -312,8 +327,8 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 
 /*
  * A2DP data callback - receives decoded PCM audio, sends to ring buffer
- * Runs on BTC task (Core 0). Audio is consumed by I2S writer task (Core 1).
- * No local DSP processing — STM32 handles DSP on the I2S bus.
+ * Runs on BTC task (Core 0). Non-blocking to avoid stalling BT stack.
+ * Audio consumed by I2S writer task on Core 1.
  */
 static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 {
@@ -321,35 +336,46 @@ static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
         return;
     }
 
-    /* Send PCM data to ring buffer for Core 1 I2S writer task.
-     * Use pdMS_TO_TICKS(0) to avoid blocking the BTC task —
-     * if the buffer is full, drop the audio frame rather than stalling BT. */
     if (xRingbufferSend(s_ringbuf, data, len, 0) != pdTRUE) {
-        ESP_LOGD(TAG, "Ring buffer full, dropping %lu bytes", (unsigned long)len);
+        ESP_LOGW(TAG, "Ring buffer full, dropping %lu bytes", (unsigned long)len);
     }
 }
 
 /*
  * I2S writer task — pinned to Core 1
- * Consumes PCM data from ring buffer and writes to I2S hardware.
+ * Pre-buffers audio data, then writes continuously to keep DMA always fed.
+ * This eliminates DMA underruns that cause crackling.
  */
 static void i2s_writer_task(void *arg)
 {
     ESP_LOGI(TAG, "I2S writer task started on Core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "Waiting for pre-buffer (%d bytes / ~%d ms)...",
+             PREBUF_BYTES, PREBUF_BYTES * 1000 / (I2S_SAMPLE_RATE * 4));
 
+    /* Wait until ring buffer has enough data to prevent initial underrun */
+    while (1) {
+        UBaseType_t items_waiting = 0;
+        vRingbufferGetInfo(s_ringbuf, NULL, NULL, NULL, NULL, &items_waiting);
+        if (items_waiting >= PREBUF_BYTES) {
+            ESP_LOGI(TAG, "Pre-buffer filled (%lu bytes), starting I2S output",
+                     (unsigned long)items_waiting);
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    /* Continuously drain ring buffer to I2S — keeps DMA always fed */
     size_t item_size = 0;
     size_t bytes_written = 0;
-
     while (1) {
-        /* Block waiting for audio data from ring buffer */
         void *data = xRingbufferReceive(s_ringbuf, &item_size, portMAX_DELAY);
         if (data != NULL && item_size > 0) {
-            /* Write PCM data directly to I2S — no DSP processing */
             i2s_channel_write(i2s_tx_handle, data, item_size, &bytes_written, portMAX_DELAY);
             vRingbufferReturnItem(s_ringbuf, data);
         }
     }
 }
+
 
 /*
  * AVRCP Controller callback for media control events
@@ -534,11 +560,58 @@ static void watchdog_task(void *arg)
     }
 }
 
+#ifdef I2S_SINE_TEST
+/*
+ * I2S sine wave test — generates 1kHz tone directly to I2S
+ * Bypasses Bluetooth entirely to isolate the I2S data path
+ */
+static void sine_test_task(void *arg)
+{
+    const int freq = 1000;
+    const int samples_per_period = I2S_SAMPLE_RATE / freq;
+    const int16_t amplitude = 16000;  /* ~50% of int16_t max */
+
+    /* Pre-compute one period of stereo sine wave */
+    int16_t sine_buf[samples_per_period * 2];
+    for (int i = 0; i < samples_per_period; i++) {
+        int16_t sample = (int16_t)(amplitude * sinf(2.0f * M_PI * i / samples_per_period));
+        sine_buf[i * 2]     = sample;  /* Left */
+        sine_buf[i * 2 + 1] = sample;  /* Right */
+    }
+
+    ESP_LOGI(TAG, "Sine test running: %d Hz, %d samples/period, amplitude=%d",
+             freq, samples_per_period, amplitude);
+
+    size_t bytes_written;
+    while (1) {
+        i2s_channel_write(i2s_tx_handle, sine_buf, sizeof(sine_buf),
+                          &bytes_written, portMAX_DELAY);
+    }
+}
+#endif
+
 /*
  * Application entry point
  */
 void app_main(void)
 {
+#ifdef I2S_SINE_TEST
+    {
+        ESP_LOGW(TAG, "=== I2S SINE TEST MODE ===");
+        ESP_LOGW(TAG, "Bluetooth disabled — testing I2S data path only");
+
+        esp_err_t err = i2s_init();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "I2S init failed, restarting...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            esp_restart();
+        }
+
+        xTaskCreatePinnedToCore(sine_test_task, "sine_test", 4096, NULL, 10, NULL, 1);
+        return;
+    }
+#endif
+
     ESP_LOGI(TAG, "=== ESP32 A2DP Sink + BLE GATT Controller (V4) ===");
     ESP_LOGI(TAG, "A2DP audio → I2S → STM32 DSP, BLE GATT control + UART");
     ESP_LOGI(TAG, "Firmware version: %s", ota_mgr_get_version());
@@ -607,7 +680,7 @@ void app_main(void)
         }
     }
 
-    /* Create I2S writer task pinned to Core 1 */
+    /* Create I2S writer task pinned to Core 1 (with pre-buffering) */
     xTaskCreatePinnedToCore(i2s_writer_task, "i2s_writer", 4096, NULL, 10, NULL, 1);
 
     /* Create watchdog monitoring task */
