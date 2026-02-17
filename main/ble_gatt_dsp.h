@@ -18,7 +18,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
-#include "dsp_processor.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -139,8 +138,8 @@ extern "C" {
 /*
  * BLE advertising configuration
  */
-#define BLE_ADV_INTERVAL_MIN    0x20    /* 20ms */
-#define BLE_ADV_INTERVAL_MAX    0x40    /* 40ms */
+#define BLE_ADV_INTERVAL_MIN    0xA0    /* 100ms */
+#define BLE_ADV_INTERVAL_MAX    0x140   /* 200ms */
 
 /*
  * Get the device name (with MAC suffix for unique identification)

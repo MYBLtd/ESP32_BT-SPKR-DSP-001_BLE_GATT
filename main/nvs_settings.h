@@ -16,8 +16,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
-#include "dsp_processor.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif

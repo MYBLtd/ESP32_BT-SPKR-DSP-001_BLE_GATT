@@ -1,12 +1,13 @@
 /*
- * ESP32 Bluetooth Speaker with DSP and BLE Control
- * FSD-DSP-001: DSP Presets + Loudness via BLE GATT
+ * ESP32 A2DP Sink + BLE GATT Controller for External DSP
+ * V4 Architecture: A2DP audio → I2S → STM32 DSP, BLE GATT control + UART forwarding
  *
- * Bluetooth A2DP sink with:
- * - I2S output to MAX98357A DAC
- * - DSP processing (EQ presets, loudness, limiter)
- * - BLE GATT control interface
- * - Persistent settings storage
+ * Dual-core architecture:
+ *   Core 0: BT controller + Bluedroid + BLE GATT + UART + OTA + NVS
+ *   Core 1: I2S writer task (audio output)
+ *
+ * Audio path: Phone (SBC) → ESP32 A2DP sink → I2S → STM32 → PCM5102A
+ * Control path: BLE GATT → UART → STM32
  *
  * For ESP-IDF v6.0-beta1 or later
  *
@@ -20,6 +21,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/ringbuf.h"
 
 #include "esp_log.h"
 #include "esp_system.h"
@@ -38,7 +40,6 @@
 #include "driver/gpio.h"
 
 /* Project modules */
-#include "dsp_processor.h"
 #include "ble_gatt_dsp.h"
 #include "nvs_settings.h"
 #include "ota_manager.h"
@@ -52,7 +53,7 @@ static const char *TAG = "BT_SPEAKER";
 /* Dynamic device name with MAC suffix (e.g., "42 Decibels-A7B3") */
 static char s_device_name[BT_DEVICE_NAME_MAX_LEN] = BT_DEVICE_NAME_BASE;
 
-/* I2S GPIO Configuration for MAX98357A */
+/* I2S GPIO Configuration (shared clocks to STM32 + PCM5102A) */
 #define I2S_BCK_PIN     GPIO_NUM_26
 #define I2S_WS_PIN      GPIO_NUM_25
 #define I2S_DATA_PIN    GPIO_NUM_22
@@ -60,7 +61,9 @@ static char s_device_name[BT_DEVICE_NAME_MAX_LEN] = BT_DEVICE_NAME_BASE;
 /* I2S configuration */
 #define I2S_SAMPLE_RATE     44100
 #define I2S_BITS_PER_SAMPLE I2S_DATA_BIT_WIDTH_16BIT
-#define I2S_CHANNEL_NUM     2
+
+/* Ring buffer for A2DP → I2S decoupling (Core 0 → Core 1) */
+#define RINGBUF_SIZE    (24 * 1024)
 
 /* Watchdog timeout in seconds */
 #define WDT_TIMEOUT_SEC     30
@@ -68,14 +71,14 @@ static char s_device_name[BT_DEVICE_NAME_MAX_LEN] = BT_DEVICE_NAME_BASE;
 /* I2S channel handle */
 static i2s_chan_handle_t i2s_tx_handle = NULL;
 
+/* Ring buffer handle */
+static RingbufHandle_t s_ringbuf = NULL;
+
 /* Connection state tracking */
 static bool s_a2dp_connected = false;
 static bool s_audio_started = false;
 
-/* Remote device address for RSSI reading */
-static esp_bd_addr_t s_remote_bda = {0};
-
-/* Current sample rate for DSP */
+/* Current sample rate */
 static uint32_t s_current_sample_rate = I2S_SAMPLE_RATE;
 
 /* Forward declarations */
@@ -83,10 +86,35 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
 static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param);
 static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len);
 static void bt_app_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param);
-static void settings_changed_callback(void);
+static void i2s_writer_task(void *arg);
 
 /*
- * Initialize I2S for audio output to MAX98357A
+ * Build device name with MAC address suffix for unique identification
+ * Format: "42 Decibels-XXXX" where XXXX is last 4 hex chars of MAC
+ */
+static void build_device_name(void)
+{
+    const uint8_t *mac = esp_bt_dev_get_address();
+    if (mac != NULL) {
+        snprintf(s_device_name, BT_DEVICE_NAME_MAX_LEN, "%s-%02X%02X",
+                 BT_DEVICE_NAME_BASE, mac[4], mac[5]);
+        ESP_LOGI(TAG, "Device name: %s", s_device_name);
+    } else {
+        ESP_LOGW(TAG, "MAC address not available, using base name");
+    }
+}
+
+/*
+ * Get the device name (for use by BLE module)
+ */
+const char *bt_get_device_name(void)
+{
+    return s_device_name;
+}
+
+/*
+ * Initialize I2S for audio output
+ * ESP32 is I2S master — BCK/LRCK shared to STM32 and PCM5102A
  */
 static esp_err_t i2s_init(void)
 {
@@ -130,7 +158,8 @@ static esp_err_t i2s_init(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "I2S initialized successfully");
+    ESP_LOGI(TAG, "I2S initialized: BCK=GPIO%d, WS=GPIO%d, DOUT=GPIO%d @ %dHz",
+             I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN, I2S_SAMPLE_RATE);
     return ESP_OK;
 }
 
@@ -147,7 +176,7 @@ static esp_err_t i2s_reconfigure(uint32_t sample_rate)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "Reconfiguring I2S to %lu Hz", sample_rate);
+    ESP_LOGI(TAG, "Reconfiguring I2S to %lu Hz", (unsigned long)sample_rate);
 
     esp_err_t ret = i2s_channel_disable(i2s_tx_handle);
     if (ret != ESP_OK) {
@@ -168,10 +197,7 @@ static esp_err_t i2s_reconfigure(uint32_t sample_rate)
         return ret;
     }
 
-    /* Update DSP sample rate */
     s_current_sample_rate = sample_rate;
-    dsp_set_sample_rate(sample_rate);
-
     return ESP_OK;
 }
 
@@ -212,25 +238,6 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
         ESP_LOGD(TAG, "Power mode changed: %d", param->mode_chg.mode);
         break;
 
-    case ESP_BT_GAP_READ_RSSI_DELTA_EVT:
-        if (param->read_rssi_delta.stat == ESP_BT_STATUS_SUCCESS) {
-            int8_t delta = param->read_rssi_delta.rssi_delta;
-            const char *quality;
-            if (delta >= 0) {
-                quality = "Excellent";
-            } else if (delta >= -5) {
-                quality = "Good";
-            } else if (delta >= -15) {
-                quality = "Fair";
-            } else {
-                quality = "Poor";
-            }
-            ESP_LOGI(TAG, "BT signal: delta=%d (%s)", delta, quality);
-        } else {
-            ESP_LOGD(TAG, "RSSI read failed, status: %d", param->read_rssi_delta.stat);
-        }
-        break;
-
     default:
         ESP_LOGD(TAG, "GAP event: %d", event);
         break;
@@ -245,11 +252,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     switch (event) {
     case ESP_A2D_CONNECTION_STATE_EVT:
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-            ESP_LOGI(TAG, "A2DP connected to %02x:%02x:%02x:%02x:%02x:%02x",
-                     param->conn_stat.remote_bda[0], param->conn_stat.remote_bda[1],
-                     param->conn_stat.remote_bda[2], param->conn_stat.remote_bda[3],
-                     param->conn_stat.remote_bda[4], param->conn_stat.remote_bda[5]);
-            memcpy(s_remote_bda, param->conn_stat.remote_bda, sizeof(esp_bd_addr_t));
+            ESP_LOGI(TAG, "A2DP connected");
             s_a2dp_connected = true;
         } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             ESP_LOGI(TAG, "A2DP disconnected");
@@ -274,14 +277,12 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             uint32_t sample_rate = 44100;  /* Safe default */
             uint8_t samp_freq = param->audio_cfg.mcc.cie.sbc_info.samp_freq;
 
-            /* Log raw value for debugging rate mismatch issues */
             ESP_LOGI(TAG, "SBC samp_freq mask: 0x%02x", samp_freq);
 
-            /* Count bits set - if multiple bits, this is a capabilities mask, not config */
+            /* Only accept single-bit config values, not capability masks */
             int bit_count = __builtin_popcount(samp_freq & 0x0F);
             if (bit_count != 1) {
                 ESP_LOGW(TAG, "samp_freq has %d bits set (expected 1), defaulting to 44.1kHz", bit_count);
-                /* Keep default 44100 - most common and safest fallback */
             } else if (samp_freq & 0x01) {
                 sample_rate = 48000;
             } else if (samp_freq & 0x02) {
@@ -292,24 +293,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 sample_rate = 16000;
             }
 
-            /* Log SBC codec quality details */
-            const char *ch_mode_str[] = {"Mono", "Dual Channel", "Stereo", "Joint Stereo"};
-            uint8_t ch_mode = param->audio_cfg.mcc.cie.sbc_info.ch_mode;
-            uint8_t bitpool = param->audio_cfg.mcc.cie.sbc_info.max_bitpool;
-            const char *mode = (ch_mode <= 3) ? ch_mode_str[ch_mode] : "Unknown";
-
-            ESP_LOGI(TAG, "SBC codec: %lu Hz, %s, bitpool=%u",
-                     sample_rate, mode, bitpool);
-
-            /* Bitpool quality indicator */
-            if (bitpool >= 51) {
-                ESP_LOGI(TAG, "SBC quality: High (bitpool %u)", bitpool);
-            } else if (bitpool >= 35) {
-                ESP_LOGI(TAG, "SBC quality: Medium (bitpool %u)", bitpool);
-            } else {
-                ESP_LOGW(TAG, "SBC quality: Low (bitpool %u)", bitpool);
-            }
-
+            ESP_LOGI(TAG, "SBC codec, sample rate: %lu Hz", (unsigned long)sample_rate);
             i2s_reconfigure(sample_rate);
         }
         break;
@@ -327,27 +311,43 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 }
 
 /*
- * A2DP data callback - receives decoded audio, processes through DSP, sends to I2S
- * This is the real-time audio path (FR-13, FR-16, FR-17)
+ * A2DP data callback - receives decoded PCM audio, sends to ring buffer
+ * Runs on BTC task (Core 0). Audio is consumed by I2S writer task (Core 1).
+ * No local DSP processing — STM32 handles DSP on the I2S bus.
  */
 static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 {
-    if (i2s_tx_handle == NULL || data == NULL || len == 0) {
+    if (s_ringbuf == NULL || data == NULL || len == 0) {
         return;
     }
 
-    /* Process audio through DSP chain
-     * Note: We cast away const because we modify in place for efficiency (FR-17)
-     * The A2DP stack doesn't use the buffer after this callback returns
-     */
-    dsp_process((int16_t *)data, len / sizeof(int16_t));
+    /* Send PCM data to ring buffer for Core 1 I2S writer task.
+     * Use pdMS_TO_TICKS(0) to avoid blocking the BTC task —
+     * if the buffer is full, drop the audio frame rather than stalling BT. */
+    if (xRingbufferSend(s_ringbuf, data, len, 0) != pdTRUE) {
+        ESP_LOGD(TAG, "Ring buffer full, dropping %lu bytes", (unsigned long)len);
+    }
+}
 
-    /* Write processed audio to I2S */
+/*
+ * I2S writer task — pinned to Core 1
+ * Consumes PCM data from ring buffer and writes to I2S hardware.
+ */
+static void i2s_writer_task(void *arg)
+{
+    ESP_LOGI(TAG, "I2S writer task started on Core %d", xPortGetCoreID());
+
+    size_t item_size = 0;
     size_t bytes_written = 0;
-    esp_err_t ret = i2s_channel_write(i2s_tx_handle, data, len, &bytes_written, portMAX_DELAY);
 
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "I2S write error: %s", esp_err_to_name(ret));
+    while (1) {
+        /* Block waiting for audio data from ring buffer */
+        void *data = xRingbufferReceive(s_ringbuf, &item_size, portMAX_DELAY);
+        if (data != NULL && item_size > 0) {
+            /* Write PCM data directly to I2S — no DSP processing */
+            i2s_channel_write(i2s_tx_handle, data, item_size, &bytes_written, portMAX_DELAY);
+            vRingbufferReturnItem(s_ringbuf, data);
+        }
     }
 }
 
@@ -390,36 +390,13 @@ static void bt_app_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param
 }
 
 /*
- * Build device name with MAC address suffix for unique identification
- * Format: "42 Decibels-XXXX" where XXXX is last 4 hex chars of MAC
- */
-static void build_device_name(void)
-{
-    const uint8_t *mac = esp_bt_dev_get_address();
-    if (mac != NULL) {
-        snprintf(s_device_name, BT_DEVICE_NAME_MAX_LEN, "%s-%02X%02X",
-                 BT_DEVICE_NAME_BASE, mac[4], mac[5]);
-        ESP_LOGI(TAG, "Device name: %s", s_device_name);
-    } else {
-        ESP_LOGW(TAG, "MAC address not available, using base name");
-    }
-}
-
-/*
- * Get the device name (for use by BLE module)
- */
-const char *bt_get_device_name(void)
-{
-    return s_device_name;
-}
-
-/*
- * Callback when DSP settings change via BLE (for NVS persistence)
+ * Callback when settings change via BLE (for NVS persistence)
  */
 static void settings_changed_callback(void)
 {
-    /* Update NVS with current DSP settings */
-    nvs_settings_update((uint8_t)dsp_get_preset(), dsp_get_loudness() ? 1 : 0);
+    nvs_dsp_settings_t settings;
+    nvs_settings_get(&settings);
+    nvs_settings_request_save();
 }
 
 /*
@@ -427,7 +404,6 @@ static void settings_changed_callback(void)
  */
 static void ota_status_callback(const ota_status_t *status)
 {
-    /* Send OTA status notification via BLE */
     ble_gatt_dsp_notify_ota_status((const uint8_t *)status);
 }
 
@@ -440,7 +416,7 @@ static esp_err_t bluetooth_init(void)
 
     ESP_LOGI(TAG, "Initializing Bluetooth (dual mode)...");
 
-    /* Initialize BT controller in dual mode */
+    /* Initialize BT controller */
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ret = esp_bt_controller_init(&bt_cfg);
     if (ret != ESP_OK) {
@@ -472,13 +448,13 @@ static esp_err_t bluetooth_init(void)
     /* Build unique device name with MAC suffix */
     build_device_name();
 
-    /* Set device name */
+    /* Set device name for Classic BT */
     esp_bt_gap_set_device_name(s_device_name);
 
     /* Register GAP callback for pairing (Classic BT) */
     esp_bt_gap_register_callback(bt_app_gap_cb);
 
-    /* Configure Secure Simple Pairing (SSP) for iOS compatibility (FR-2) */
+    /* Configure Secure Simple Pairing (SSP) for iOS compatibility */
     esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
     esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_IO;
     esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
@@ -488,7 +464,20 @@ static esp_err_t bluetooth_init(void)
     esp_bt_pin_code_t pin_code;
     esp_bt_gap_set_pin(pin_type, 0, pin_code);
 
-    /* Initialize A2DP sink */
+    /* Initialize AVRCP controller (must be before A2DP) */
+    ret = esp_avrc_ct_register_callback(bt_app_avrc_ct_cb);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AVRC register callback failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_avrc_ct_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AVRC controller init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Initialize A2DP sink (after AVRC) */
     ret = esp_a2d_register_callback(bt_app_a2d_cb);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "A2DP register callback failed: %s", esp_err_to_name(ret));
@@ -507,28 +496,15 @@ static esp_err_t bluetooth_init(void)
         return ret;
     }
 
-    /* Initialize AVRCP controller */
-    ret = esp_avrc_ct_register_callback(bt_app_avrc_ct_cb);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "AVRC register callback failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = esp_avrc_ct_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "AVRC controller init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
     /* Set discoverable and connectable mode for Classic BT */
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 
-    ESP_LOGI(TAG, "Classic Bluetooth initialized, device name: %s", s_device_name);
+    ESP_LOGI(TAG, "Classic Bluetooth initialized");
 
-    /* Initialize BLE GATT DSP control service */
+    /* Initialize BLE GATT control service */
     ret = ble_gatt_dsp_init(settings_changed_callback);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "BLE GATT DSP init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "BLE GATT init failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
@@ -544,19 +520,17 @@ static void watchdog_task(void *arg)
 {
     ESP_LOGI(TAG, "Watchdog task started");
 
-    /* Subscribe this task to the watchdog */
     esp_task_wdt_add(NULL);
 
     while (1) {
-        /* Feed watchdog periodically to prevent system reset */
         esp_task_wdt_reset();
 
-        /* Read BT RSSI when A2DP is connected */
         if (s_a2dp_connected) {
-            esp_bt_gap_read_rssi_delta(s_remote_bda);
+            /* Read RSSI for connection quality monitoring */
+            /* (RSSI read is async — result comes via GAP callback) */
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
@@ -565,11 +539,11 @@ static void watchdog_task(void *arg)
  */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== ESP32 Bluetooth Speaker with DSP ===");
-    ESP_LOGI(TAG, "FSD-DSP-001: DSP Presets + Loudness via BLE GATT");
+    ESP_LOGI(TAG, "=== ESP32 A2DP Sink + BLE GATT Controller (V4) ===");
+    ESP_LOGI(TAG, "A2DP audio → I2S → STM32 DSP, BLE GATT control + UART");
     ESP_LOGI(TAG, "Firmware version: %s", ota_mgr_get_version());
 
-    /* Log heap info for AAC feasibility check */
+    /* Log heap info */
     ESP_LOGI(TAG, "Heap: free=%lu, largest_block=%lu, DRAM=%lu",
              (unsigned long)esp_get_free_heap_size(),
              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
@@ -590,7 +564,7 @@ void app_main(void)
         ESP_LOGW(TAG, "NVS settings init failed, using defaults");
     }
 
-    /* Configure Task Watchdog Timer for crash recovery (FR-6) */
+    /* Configure Task Watchdog Timer for crash recovery */
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = WDT_TIMEOUT_SEC * 1000,
         .idle_core_mask = 0,
@@ -598,22 +572,13 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_task_wdt_reconfigure(&wdt_config));
 
-    /* Initialize DSP processor */
-    ret = dsp_init(I2S_SAMPLE_RATE);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "DSP initialization failed, restarting...");
+    /* Create ring buffer for A2DP → I2S decoupling */
+    s_ringbuf = xRingbufferCreate(RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
+    if (s_ringbuf == NULL) {
+        ESP_LOGE(TAG, "Failed to create ring buffer, restarting...");
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_restart();
     }
-
-    /* Load stored settings and apply to DSP */
-    nvs_dsp_settings_t settings;
-    nvs_settings_get(&settings);
-    dsp_set_preset((dsp_preset_t)settings.preset_id);
-    dsp_set_loudness(settings.loudness != 0);
-    ESP_LOGI(TAG, "Loaded settings: preset=%s, loudness=%s",
-             dsp_preset_name((dsp_preset_t)settings.preset_id),
-             settings.loudness ? "ON" : "OFF");
 
     /* Initialize I2S for audio output */
     ret = i2s_init();
@@ -623,7 +588,7 @@ void app_main(void)
         esp_restart();
     }
 
-    /* Initialize Bluetooth (Classic + BLE) */
+    /* Initialize Bluetooth (Classic A2DP + BLE GATT) */
     ret = bluetooth_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Bluetooth initialization failed, restarting...");
@@ -635,23 +600,30 @@ void app_main(void)
     ret = ota_mgr_init(ota_status_callback);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "OTA manager init failed: %s", esp_err_to_name(ret));
-        /* Non-fatal - continue without OTA support */
     } else {
         ESP_LOGI(TAG, "OTA manager initialized");
-        /* Check for pending firmware validation */
         if (ota_mgr_is_pending_verify()) {
             ESP_LOGW(TAG, "New firmware pending validation - send VALIDATE command via BLE");
         }
     }
 
+    /* Create I2S writer task pinned to Core 1 */
+    xTaskCreatePinnedToCore(i2s_writer_task, "i2s_writer", 4096, NULL, 10, NULL, 1);
+
     /* Create watchdog monitoring task */
     xTaskCreate(watchdog_task, "watchdog", 2048, NULL, 5, NULL);
 
+    /* Log cached settings */
+    nvs_dsp_settings_t settings;
+    nvs_settings_get(&settings);
+
     ESP_LOGI(TAG, "System ready");
-    ESP_LOGI(TAG, "- Classic BT: Waiting for A2DP audio connection");
-    ESP_LOGI(TAG, "- BLE: DSP control service advertising");
+    ESP_LOGI(TAG, "- Classic BT: A2DP sink waiting for audio connection");
+    ESP_LOGI(TAG, "- BLE: GATT control service advertising");
+    ESP_LOGI(TAG, "- UART: Forwarding commands to external DSP (STM32)");
+    ESP_LOGI(TAG, "- I2S: BCK=GPIO%d, WS=GPIO%d, DOUT=GPIO%d → STM32",
+             I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
     ESP_LOGI(TAG, "- OTA: Hybrid BLE+WiFi updates enabled");
-    ESP_LOGI(TAG, "- DSP: %s preset, loudness %s",
-             dsp_preset_name(dsp_get_preset()),
-             dsp_get_loudness() ? "ON" : "OFF");
+    ESP_LOGI(TAG, "- Cached settings: preset=%d, loudness=%s",
+             settings.preset_id, settings.loudness ? "ON" : "OFF");
 }

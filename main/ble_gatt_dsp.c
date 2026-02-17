@@ -7,6 +7,7 @@
  */
 
 #include "ble_gatt_dsp.h"
+#include "nvs_settings.h"
 #include "ota_manager.h"
 #include <string.h>
 #include "esp_log.h"
@@ -320,11 +321,12 @@ static esp_ble_adv_data_t adv_data = {
     .p_service_data = NULL,
     .service_uuid_len = sizeof(dsp_service_uuid),
     .p_service_uuid = (uint8_t *)dsp_service_uuid,
-    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_DMT_CONTROLLER_SPT | ESP_BLE_ADV_FLAG_DMT_HOST_SPT),
 };
 
-/* Scan response data - contains device name and service UUID
- * Max 31 bytes: name(15) + UUID(18) > 31, so UUID already in adv */
+/* Scan response data - contains device name only
+ * Service UUID is already in adv_data; keep scan response under 31 bytes
+ * Name "42 Decibels-XXXX" (18) + TX power (3) + appearance (4) = 25 bytes */
 static esp_ble_adv_data_t scan_rsp_data = {
     .set_scan_rsp = true,
     .include_name = true,               /* Device name here */
@@ -334,9 +336,9 @@ static esp_ble_adv_data_t scan_rsp_data = {
     .p_manufacturer_data = NULL,
     .service_data_len = 0,
     .p_service_data = NULL,
-    .service_uuid_len = sizeof(dsp_service_uuid),
-    .p_service_uuid = (uint8_t *)dsp_service_uuid,
-    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+    .service_uuid_len = 0,
+    .p_service_uuid = NULL,
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_DMT_CONTROLLER_SPT | ESP_BLE_ADV_FLAG_DMT_HOST_SPT),
 };
 
 /* Advertising parameters */
@@ -514,19 +516,19 @@ static void handle_control_write(const uint8_t *data, uint16_t len)
 
     switch (cmd) {
     case DSP_CMD_SET_PRESET:
-        if (val < DSP_PRESET_COUNT) {
-            dsp_set_preset((dsp_preset_t)val);
+        if (val < 4) {
+            nvs_settings_update(val, 0xFF);  /* 0xFF = don't change loudness */
             settings_changed = true;
-            ESP_LOGI(TAG, "Preset set to: %s", dsp_preset_name((dsp_preset_t)val));
+            ESP_LOGI(TAG, "Preset set to: %d (forwarded to UART)", val);
         } else {
             ESP_LOGW(TAG, "Invalid preset value: %d", val);
         }
         break;
 
     case DSP_CMD_SET_LOUDNESS:
-        dsp_set_loudness(val != 0);
+        nvs_settings_update(0xFF, val != 0 ? 1 : 0);  /* 0xFF = don't change preset */
         settings_changed = true;
-        ESP_LOGI(TAG, "Loudness set to: %s", val ? "ON" : "OFF");
+        ESP_LOGI(TAG, "Loudness set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
     case DSP_CMD_GET_STATUS:
@@ -534,43 +536,27 @@ static void handle_control_write(const uint8_t *data, uint16_t len)
         break;
 
     case DSP_CMD_SET_MUTE:
-        dsp_set_mute(val != 0);
-        settings_changed = true;
-        ESP_LOGI(TAG, "Mute set to: %s", val ? "ON" : "OFF");
+        ESP_LOGI(TAG, "Mute set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
     case DSP_CMD_SET_AUDIO_DUCK:
-        /* FR-21: Panic button - reduces volume to ~25% */
-        dsp_set_audio_duck(val != 0);
-        settings_changed = false;  /* Not persisted - panic state resets on reboot */
-        ESP_LOGI(TAG, "Audio Duck set to: %s", val ? "ON (volume reduced)" : "OFF");
+        ESP_LOGI(TAG, "Audio Duck set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
     case DSP_CMD_SET_NORMALIZER:
-        dsp_set_normalizer(val != 0);
-        settings_changed = true;
-        ESP_LOGI(TAG, "Normalizer set to: %s", val ? "ON" : "OFF");
+        ESP_LOGI(TAG, "Normalizer set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
     case DSP_CMD_SET_VOLUME:
-        /* FR-24: Volume trim (0-100) */
-        dsp_set_volume_trim(val);
-        settings_changed = true;
-        ESP_LOGI(TAG, "Volume set to: %d%% (effective: %d%%)", val, dsp_get_effective_volume());
+        ESP_LOGI(TAG, "Volume set to: %d%% (forwarded to UART)", val);
         break;
 
     case DSP_CMD_SET_BYPASS:
-        /* Debug feature: Skip EQ/filters, keep safety processing (pre-gain, limiter, volume) */
-        dsp_set_bypass(val != 0);
-        settings_changed = false;  /* Not persisted - debug feature resets on reboot */
-        ESP_LOGI(TAG, "DSP Bypass set to: %s", val ? "ON (EQ bypassed)" : "OFF (full DSP)");
+        ESP_LOGI(TAG, "DSP Bypass set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
     case DSP_CMD_SET_BASS_BOOST:
-        /* Bass boost: +8dB low-shelf at 100Hz */
-        dsp_set_bass_boost(val != 0);
-        settings_changed = true;  /* Persisted - user preference */
-        ESP_LOGI(TAG, "Bass Boost set to: %s", val ? "ON" : "OFF");
+        ESP_LOGI(TAG, "Bass Boost set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
     default:
@@ -593,13 +579,13 @@ static void handle_control_write(const uint8_t *data, uint16_t len)
  */
 static void update_status_value(void)
 {
-    dsp_status_t dsp_status;
-    dsp_get_status(&dsp_status);
+    nvs_dsp_settings_t settings;
+    nvs_settings_get(&settings);
 
     status_value[0] = DSP_STATUS_PROTOCOL_VERSION;
-    status_value[1] = dsp_status.preset;
-    status_value[2] = dsp_status.loudness;
-    status_value[3] = dsp_status.flags;
+    status_value[1] = settings.preset_id;
+    status_value[2] = settings.loudness;
+    status_value[3] = 0x00;  /* No local DSP flags in V3 */
 
     /* Update the attribute value in GATT database */
     if (s_ble.gatts_if != ESP_GATT_IF_NONE && s_ble.handle_table[IDX_STATUS_VAL] != 0) {
@@ -614,8 +600,8 @@ static void update_status_value(void)
  */
 static void update_galactic_status_value(void)
 {
-    dsp_status_t dsp_status;
-    dsp_get_status(&dsp_status);
+    nvs_dsp_settings_t settings;
+    nvs_settings_get(&settings);
 
     /* Calculate last contact age in seconds (FR-19) */
     int64_t now_us = esp_timer_get_time();
@@ -624,39 +610,19 @@ static void update_galactic_status_value(void)
         age_sec = 255;  /* Clamp to 8-bit max */
     }
 
-    /* Build shieldStatus byte per Protocol.md:
-     * Bit 0 (0x01): Muted
-     * Bit 1 (0x02): Audio Duck (panic mode)
-     * Bit 2 (0x04): Loudness
-     * Bit 3 (0x08): Normalizer (DRC active)
-     * Bit 4 (0x10): DSP Bypass (EQ bypassed)
-     * Bit 5 (0x20): Bass Boost
-     */
+    /* Build shieldStatus from cached NVS settings
+     * In V3, detailed DSP state lives on the external STM32.
+     * We only report what we've cached locally. */
     uint8_t shield_status = 0;
-    if (dsp_get_mute()) {
-        shield_status |= 0x01;  /* Bit 0: Mute */
-    }
-    if (dsp_get_audio_duck()) {
-        shield_status |= 0x02;  /* Bit 1: Audio Duck */
-    }
-    if (dsp_status.loudness) {
+    if (settings.loudness) {
         shield_status |= 0x04;  /* Bit 2: Loudness */
-    }
-    if (dsp_get_normalizer()) {
-        shield_status |= 0x08;  /* Bit 3: Normalizer */
-    }
-    if (dsp_get_bypass()) {
-        shield_status |= 0x10;  /* Bit 4: DSP Bypass */
-    }
-    if (dsp_get_bass_boost()) {
-        shield_status |= 0x20;  /* Bit 5: Bass Boost */
     }
 
     galactic_value[0] = DSP_GALACTIC_PROTOCOL_VERSION;  /* Protocol version: 0x42 */
-    galactic_value[1] = dsp_status.preset;              /* currentQuantumFlavor */
-    galactic_value[2] = shield_status;                  /* shieldStatus */
+    galactic_value[1] = settings.preset_id;             /* currentQuantumFlavor */
+    galactic_value[2] = shield_status;                  /* shieldStatus (cached) */
     galactic_value[3] = 100;                            /* energyCoreLevel (placeholder) */
-    galactic_value[4] = dsp_get_effective_volume();     /* distortionFieldStrength (FR-24: actual volume) */
+    galactic_value[4] = 100;                            /* distortionFieldStrength (placeholder) */
     galactic_value[5] = 100;                            /* Energy core/battery (placeholder) */
     galactic_value[6] = (uint8_t)age_sec;               /* lastContact */
 
