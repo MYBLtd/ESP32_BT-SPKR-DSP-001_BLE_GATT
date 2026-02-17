@@ -47,7 +47,7 @@ static esp_err_t do_save(void);
  */
 static void set_defaults(nvs_dsp_settings_t *settings)
 {
-    settings->preset_id = DSP_PRESET_OFFICE;
+    settings->preset_id = 0;  /* Default preset */
     settings->loudness = 0;
     settings->bass_level = 0;
     settings->treble_level = 0;
@@ -270,14 +270,18 @@ void nvs_settings_get(nvs_dsp_settings_t *settings)
 
 void nvs_settings_update(uint8_t preset, uint8_t loudness)
 {
-    /* Validate preset */
-    if (preset >= DSP_PRESET_COUNT) {
-        preset = DSP_PRESET_OFFICE;
+    /* Update preset if not 0xFF (sentinel for "no change") */
+    if (preset != 0xFF) {
+        if (preset >= 4) {
+            preset = 0;  /* Default preset */
+        }
+        s_nvs.settings.preset_id = preset;
     }
 
-    /* Update cached settings */
-    s_nvs.settings.preset_id = preset;
-    s_nvs.settings.loudness = loudness ? 1 : 0;
+    /* Update loudness if not 0xFF (sentinel for "no change") */
+    if (loudness != 0xFF) {
+        s_nvs.settings.loudness = loudness ? 1 : 0;
+    }
 
     /* Request debounced save */
     nvs_settings_request_save();
