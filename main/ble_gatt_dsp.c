@@ -380,6 +380,18 @@ static ble_state_t s_ble = {
 /* UART echo state */
 static bool s_uart_echo_initialized = false;
 
+/* Transient DSP state — not persisted in NVS, tracked locally for status notifications.
+ * FLAGS byte bit layout (shared by STATUS[3] and shieldStatus in GalacticStatus):
+ *   Bit 0 (0x01): Mute
+ *   Bit 1 (0x02): Audio Duck
+ *   Bit 2 (0x04): Loudness  (also in NVS)
+ *   Bit 3 (0x08): Normalizer
+ *   Bit 4 (0x10): Bass Boost
+ *   Bit 5 (0x20): Bypass
+ */
+static uint8_t s_dsp_flags = 0x00;  /* All off at startup */
+static uint8_t s_dsp_volume = 100;  /* Default 100% */
+
 /* Forward declarations */
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
@@ -527,6 +539,7 @@ static void handle_control_write(const uint8_t *data, uint16_t len)
 
     case DSP_CMD_SET_LOUDNESS:
         nvs_settings_update(0xFF, val != 0 ? 1 : 0);  /* 0xFF = don't change preset */
+        if (val) s_dsp_flags |= 0x04; else s_dsp_flags &= ~0x04;
         settings_changed = true;
         ESP_LOGI(TAG, "Loudness set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
@@ -536,26 +549,32 @@ static void handle_control_write(const uint8_t *data, uint16_t len)
         break;
 
     case DSP_CMD_SET_MUTE:
+        if (val) s_dsp_flags |= 0x01; else s_dsp_flags &= ~0x01;
         ESP_LOGI(TAG, "Mute set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
     case DSP_CMD_SET_AUDIO_DUCK:
+        if (val) s_dsp_flags |= 0x02; else s_dsp_flags &= ~0x02;
         ESP_LOGI(TAG, "Audio Duck set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
     case DSP_CMD_SET_NORMALIZER:
+        if (val) s_dsp_flags |= 0x08; else s_dsp_flags &= ~0x08;
         ESP_LOGI(TAG, "Normalizer set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
     case DSP_CMD_SET_VOLUME:
+        s_dsp_volume = val;
         ESP_LOGI(TAG, "Volume set to: %d%% (forwarded to UART)", val);
         break;
 
     case DSP_CMD_SET_BYPASS:
+        if (val) s_dsp_flags |= 0x20; else s_dsp_flags &= ~0x20;
         ESP_LOGI(TAG, "DSP Bypass set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
     case DSP_CMD_SET_BASS_BOOST:
+        if (val) s_dsp_flags |= 0x10; else s_dsp_flags &= ~0x10;
         ESP_LOGI(TAG, "Bass Boost set to: %s (forwarded to UART)", val ? "ON" : "OFF");
         break;
 
@@ -582,10 +601,14 @@ static void update_status_value(void)
     nvs_dsp_settings_t settings;
     nvs_settings_get(&settings);
 
+    /* Merge loudness (NVS) into flags bit 2 */
+    uint8_t flags = s_dsp_flags;
+    if (settings.loudness) flags |= 0x04; else flags &= ~0x04;
+
     status_value[0] = DSP_STATUS_PROTOCOL_VERSION;
     status_value[1] = settings.preset_id;
     status_value[2] = settings.loudness;
-    status_value[3] = 0x00;  /* No local DSP flags in V3 */
+    status_value[3] = flags;  /* All DSP feature flags */
 
     /* Update the attribute value in GATT database */
     if (s_ble.gatts_if != ESP_GATT_IF_NONE && s_ble.handle_table[IDX_STATUS_VAL] != 0) {
@@ -610,20 +633,16 @@ static void update_galactic_status_value(void)
         age_sec = 255;  /* Clamp to 8-bit max */
     }
 
-    /* Build shieldStatus from cached NVS settings
-     * In V3, detailed DSP state lives on the external STM32.
-     * We only report what we've cached locally. */
-    uint8_t shield_status = 0;
-    if (settings.loudness) {
-        shield_status |= 0x04;  /* Bit 2: Loudness */
-    }
+    /* Build shieldStatus from all tracked DSP flags */
+    uint8_t shield_status = s_dsp_flags;
+    if (settings.loudness) shield_status |= 0x04; else shield_status &= ~0x04;
 
     galactic_value[0] = DSP_GALACTIC_PROTOCOL_VERSION;  /* Protocol version: 0x42 */
     galactic_value[1] = settings.preset_id;             /* currentQuantumFlavor */
-    galactic_value[2] = shield_status;                  /* shieldStatus (cached) */
+    galactic_value[2] = shield_status;                  /* shieldStatus: all DSP feature flags */
     galactic_value[3] = 100;                            /* energyCoreLevel (placeholder) */
-    galactic_value[4] = 100;                            /* distortionFieldStrength (placeholder) */
-    galactic_value[5] = 100;                            /* Energy core/battery (placeholder) */
+    galactic_value[4] = s_dsp_volume;                   /* distortionFieldStrength (volume 0-100) */
+    galactic_value[5] = 100;                            /* battery (placeholder) */
     galactic_value[6] = (uint8_t)age_sec;               /* lastContact */
 
     /* Update the attribute value in GATT database */
@@ -850,6 +869,11 @@ esp_err_t ble_gatt_dsp_init(ble_dsp_settings_cb_t settings_changed_cb)
     ESP_LOGI(TAG, "Initializing BLE GATT DSP service");
 
     s_ble.settings_cb = settings_changed_cb;
+
+    /* Initialise flags from NVS (loudness persists across reboots) */
+    nvs_dsp_settings_t boot_settings;
+    nvs_settings_get(&boot_settings);
+    if (boot_settings.loudness) s_dsp_flags |= 0x04;
 
     /* Initialize UART for serial echo of GATT commands */
     esp_err_t ret = uart_echo_init();
