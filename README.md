@@ -1,25 +1,22 @@
-# ESP32 Bluetooth Speaker with DSP and BLE Control
+# ESP32 A2DP Bluetooth Sink with BLE GATT Relay
 
-A Bluetooth A2DP audio receiver with real-time DSP processing and BLE GATT control interface for ESP32. Part of the 42 Decibels audio platform.
+Bluetooth A2DP audio receiver and BLE GATT relay for the 42 Decibels audio platform. The ESP32 receives audio over Bluetooth (A2DP) and forwards it via I2S to the STM32 DSP engine. BLE GATT commands from the 42 Decibels app are forwarded to the STM32 over UART — all DSP processing runs on the STM32.
+
+> **Note:** Prior to v2.4.0 this firmware included its own DSP processing chain (biquad EQ, loudness, normalizer, limiter). That code was removed in v2.4.0 when DSP was moved to the dedicated STM32 DSP engine. See [Legacy: ESP32-side DSP (≤ v2.3.1)](#legacy-esp32-side-dsp--v231) below.
 
 **Version:** 2.4.3 | **Date:** 2026-02-18
 
 ## Features
 
 - **Bluetooth A2DP Sink** — Receive high-quality audio from phones, tablets, and computers
-- **Real-time DSP Processing** — EQ presets, loudness enhancement, bass boost, normalizer, limiter
-- **BLE GATT Control** — Change DSP settings wirelessly using any generic BLE app or the 42 Decibels iOS app
-- **Bass Boost** — Dedicated +8dB low-shelf boost at 100Hz for small speakers
-- **Mute & DSP Bypass** — Instant mute and bypass mode (bypass keeps safety processing)
-- **Audio Duck** — Panic button for instant volume reduction (-12dB)
-- **Normalizer (DRC)** — Dynamic range compression for late-night listening
-- **Volume Control** — Device-side volume trim with preset-based caps
-- **Sine Test** — Internal 1kHz tone generator for DAC/amp verification (v2.4.1+)
-- **OTA Firmware Updates** — Over-the-air updates via BLE provisioning + WiFi download
-- **GalacticStatus** — Extended status reporting with periodic notifications (2×/sec)
-- **Persistent Settings** — Settings survive power cycles via NVS flash storage
+- **I2S Audio Output** — Streams received audio to I2S DAC or STM32 DSP engine
+- **BLE GATT Control** — Receives DSP commands wirelessly from the 42 Decibels iOS/Watch app
 - **UART DSP Relay** — Forwards BLE commands to external STM32 DSP engine via UART (GPIO4/GPIO5 @ 115200)
+- **GalacticStatus** — Extended status reporting with periodic BLE notifications (2×/sec)
+- **OTA Firmware Updates** — Over-the-air updates via BLE provisioning + WiFi download
+- **Persistent Settings** — Settings survive power cycles via NVS flash storage
 - **iOS Compatible** — Secure Simple Pairing (SSP) for seamless iOS pairing
+- **BT RSSI Monitoring** — Reads Bluetooth signal strength every 10s when A2DP is active
 
 ## Hardware Requirements
 
@@ -245,73 +242,34 @@ Format: `[STATE] [ERROR] [PROGRESS] [DL_KB_L] [DL_KB_H] [TOTAL_KB_L] [TOTAL_KB_H
 | 5-6 | TOTAL_KB | Total firmware size (little-endian KB) |
 | 7 | RSSI | WiFi signal strength (signed dBm) |
 
-## DSP Architecture
+## Legacy: ESP32-side DSP (≤ v2.3.1)
 
-### Signal Chain (ESP32 Internal)
+Up to and including **v2.3.1**, this firmware contained a full DSP processing chain running on the ESP32 itself (`dsp_processor.c/h`). This is useful as a reference or for standalone use without the STM32 DSP engine.
+
+**Last tag with ESP32-side DSP: [v2.3.1](https://github.com/MYBLtd/ChoticVolt-ESP32_I2S_Master_with_BLE_GATT/releases/tag/v2.3.1)**
+
+The v2.3.1 signal chain was:
 
 ```
 Input → Pre-gain (-3dB) → HPF (95Hz) → Preset EQ → Loudness → Bass Boost → Normalizer → Limiter → Volume → Duck → Mute → Output
 ```
 
-In **Bypass mode**, the following stages are skipped: HPF, Preset EQ, Loudness, Bass Boost, Normalizer. Pre-gain, Limiter, Volume, Duck, and Mute remain active to protect downstream hardware.
+DSP components in v2.3.1:
 
-### Components
+| Component | Description |
+|-----------|-------------|
+| Pre-gain | -3 dB headroom (always active) |
+| High-pass Filter | 2nd-order Butterworth @ 95 Hz |
+| Preset EQ | 4-band parametric EQ (OFFICE / FULL / NIGHT / SPEECH) |
+| Loudness | Bass +12dB @ 80Hz, treble +6dB @ 12kHz |
+| Bass Boost | Low-shelf +8dB @ 100Hz |
+| Normalizer | Block DRC — threshold -20dB, ratio 4:1, +6dB makeup |
+| Limiter | Peak limiter @ -1 dBFS (3ms attack, 120ms release) |
+| Volume | Device-side trim 0–100 |
+| Audio Duck | -12dB panic reduction |
+| Mute | Final output gate |
 
-1. **Pre-gain**: -3 dB headroom for EQ boosts (always active, even in bypass)
-2. **High-pass Filter**: 2nd-order Butterworth at 95 Hz (driver protection)
-3. **Preset EQ**: 4-band parametric EQ per preset
-4. **Loudness Overlay**: 2-band shelf EQ (bass +12dB @ 80Hz, treble +6dB @ 12kHz)
-5. **Bass Boost**: Low-shelf +8dB @ 100Hz
-6. **Normalizer**: Block-based DRC (threshold -20dB, ratio 4:1, +6dB makeup)
-7. **Limiter**: Peak limiter at -1 dBFS (3ms attack, 120ms release) — always active
-8. **Volume Trim**: Device-side volume control (0–100, capped by preset)
-9. **Audio Duck**: Panic button volume reduction (-12dB)
-10. **Mute**: Final output gate
-
-### Preset EQ Curves
-
-#### OFFICE (Background/Mild)
-| Band | Type | Frequency | Gain | Q/Slope |
-|------|------|-----------|------|---------|
-| 1 | Low-shelf | 150 Hz | +3.0 dB | S=0.7 |
-| 2 | Peaking | 350 Hz | -1.5 dB | Q=1.0 |
-| 3 | Peaking | 3000 Hz | +1.0 dB | Q=1.0 |
-| 4 | High-shelf | 9000 Hz | +2.0 dB | S=0.7 |
-
-#### FULL (Rich/Enhanced)
-| Band | Type | Frequency | Gain | Q/Slope |
-|------|------|-----------|------|---------|
-| 1 | Low-shelf | 100 Hz | +9.0 dB | S=0.7 |
-| 2 | Peaking | 300 Hz | -2.0 dB | Q=1.0 |
-| 3 | Peaking | 3500 Hz | +3.0 dB | Q=1.2 |
-| 4 | High-shelf | 10000 Hz | +5.0 dB | S=0.7 |
-
-#### NIGHT (Low Volume)
-| Band | Type | Frequency | Gain | Q/Slope |
-|------|------|-----------|------|---------|
-| 1 | Low-shelf | 160 Hz | +2.5 dB | S=0.8 |
-| 2 | Peaking | 350 Hz | -1.0 dB | Q=1.0 |
-| 3 | Peaking | 2500 Hz | +1.0 dB | Q=1.0 |
-| 4 | High-shelf | 9000 Hz | +1.0 dB | S=0.7 |
-
-#### SPEECH (Voice Clarity)
-| Band | Type | Frequency | Gain | Q/Slope |
-|------|------|-----------|------|---------|
-| 1 | Low-shelf | 170 Hz | -2.0 dB | S=0.8 |
-| 2 | Peaking | 300 Hz | -1.0 dB | Q=1.0 |
-| 3 | Peaking | 3200 Hz | +3.0 dB | Q=1.0 |
-| 4 | Peaking | 7500 Hz | -1.0 dB | Q=2.0 |
-
-### Loudness Overlay (Aggressive)
-| Band | Type | Frequency | Gain | Q/Slope |
-|------|------|-----------|------|---------|
-| L1 | Low-shelf | 80 Hz | +12.0 dB | S=0.6 |
-| L2 | High-shelf | 12000 Hz | +6.0 dB | S=0.5 |
-
-### Bass Boost
-| Type | Frequency | Gain | Slope |
-|------|-----------|------|-------|
-| Low-shelf | 100 Hz | +8.0 dB | S=0.7 |
+> The DSP module was removed in v2.4.0 ("Release v2.4.0: V4 architecture — A2DP sink + BLE GATT dual mode") when DSP processing was migrated to the external STM32 DSP engine.
 
 ## Project Structure
 
@@ -324,9 +282,8 @@ In **Bypass mode**, the following stages are skipped: HPF, Preset EQ, Loudness, 
 ├── sdkconfig.defaults
 └── main/
     ├── CMakeLists.txt
-    ├── main.c                       # Application entry point
-    ├── dsp_processor.h/.c           # DSP implementation (biquads, presets, limiter)
-    ├── ble_gatt_dsp.h/.c            # BLE GATT service implementation
+    ├── main.c                       # Application entry point + A2DP/I2S handling
+    ├── ble_gatt_dsp.h/.c            # BLE GATT service + UART relay to STM32
     ├── nvs_settings.h/.c            # Persistent storage (NVS)
     ├── ota_manager.h/.c             # OTA state machine and download logic
     └── wifi_manager.h/.c            # WiFi STA mode for OTA downloads
@@ -355,9 +312,6 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 - **Device Name**: Change `BT_DEVICE_NAME` in `main.c`
 - **I2S Pins**: Modify `I2S_BCK_PIN`, `I2S_WS_PIN`, `I2S_DATA_PIN` in `main.c`
 - **UART DSP Relay**: GPIO4/GPIO5 @ 115200 baud — always enabled when STM32 DSP engine is wired
-- **EQ Curves**: Edit `preset_params` array in `dsp_processor.c`
-- **Limiter Settings**: Adjust `DSP_LIMITER_*` defines in `dsp_processor.h`
-- **Bass Boost Settings**: Adjust `DSP_BASS_BOOST_*` defines in `dsp_processor.h`
 
 ## Changelog
 
@@ -377,6 +331,7 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 - **New:** V4 architecture — dual Classic BT A2DP + BLE GATT in same firmware
 - **New:** UART echo of BLE GATT commands to external STM32 DSP engine (GPIO4/GPIO5 @ 115200)
 - **New:** BT RSSI monitoring and SBC codec quality logging
+- **Removed:** `dsp_processor` module — DSP processing migrated to external STM32 DSP engine
 
 ### v2.3.0 (2026-01-28)
 - **New:** Bass Boost feature (+8dB @ 100Hz) — command `0x09`
