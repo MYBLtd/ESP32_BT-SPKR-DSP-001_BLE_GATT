@@ -402,15 +402,37 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 ### v1.1.0 (2026-01-21)
 - Initial release with DSP presets and loudness
 
+## Related Projects
+
+This firmware is one of three projects that form the **42dB audio system**:
+
+| Project | Repository | Role |
+|---------|-----------|------|
+| **42dB STM32 DSP Engine** | [ChaoticVolt-42dB_STM32_DSP_engine](https://github.com/MYBLtd/ChaoticVolt-42dB_STM32_DSP_engine) | Real-time audio DSP processor |
+| **42dB iPhone & Apple Watch App** | [ChaoticVolt-42_Decibels-iPhone-and-WatchOS-app](https://github.com/MYBLtd/ChaoticVolt-42_Decibels-iPhone-and-WatchOS-app) | BLE GATT control interface |
+| **ESP32 BLE GATT / A2DP firmware** (this repo) | [ChoticVolt-ESP32_I2S_Master_with_BLE_GATT](https://github.com/MYBLtd/ChoticVolt-ESP32_I2S_Master_with_BLE_GATT) | A2DP Bluetooth sink + GATT relay |
+
+### Version Compatibility
+
+The three projects communicate over a shared **UART/BLE protocol** (command format `GATT:CTRL:<hex>`). When the protocol changes, all three must be updated together:
+
+| Protocol | STM32 DSP Engine | ESP32 Firmware | iPhone/Watch App |
+|----------|-----------------|----------------|-----------------|
+| v1 | v0.3.0 – v0.5.x | v2.4.1 – v2.4.3 | v1.0.x |
+
 ## License
 
-MIT License — See LICENSE file for details.
+PolyForm Noncommercial 1.0.0 — See [LICENSE](LICENSE). Commercial use requires explicit written permission.
 
 ## Author
 
 Robin Kluit
 
-## Acknowledgments
+## References
 
-- Espressif Systems for ESP-IDF
-- Audio EQ Cookbook by Robert Bristow-Johnson for biquad filter formulas
+- [Audio EQ Cookbook](https://www.w3.org/2011/audio/audio-eq-cookbook.html) — Robert Bristow-Johnson's biquad filter formulas
+- [ESP-IDF Programming Guide](https://docs.espressif.com/projects/esp-idf/en/latest/) — Espressif Systems
+
+## Maintenance
+
+This repo currently does not accept external pull requests. Please use Issues or Discussions for reports and suggestions.
