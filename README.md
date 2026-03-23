@@ -6,7 +6,13 @@ Bluetooth A2DP audio receiver and BLE GATT relay for the 42 Decibels audio platf
 
 **Version:** 2.4.3 | **Date:** 2026-02-18
 
-## Features
+# ChaoticVolt BLE-I2S Bridge
+
+Bluetooth A2DP and BLE GATT bridge for the ChaoticVolt 42dB platform, relaying audio over I2S and control over UART to the DSP engine.
+
+This repository contains the bridge layer that sits between the user-facing control side of the 42dB platform and the downstream DSP engine. It handles Bluetooth audio ingress, BLE-facing control, transport-side coordination, and control forwarding toward `ChaoticVolt-42dB-DSP-Engine`.
+
+[ChaoticVolt Website](https://chaoticvolt.eu)
 
 - **Bluetooth A2DP Sink** — Receive high-quality audio from phones, tablets, and computers
 - **I2S Audio Output** — Streams received audio to I2S DAC or STM32 DSP engine
@@ -17,20 +23,24 @@ Bluetooth A2DP audio receiver and BLE GATT relay for the 42 Decibels audio platf
 - **Persistent Settings** — Settings survive power cycles via NVS flash storage
 - **iOS Compatible** — Secure Simple Pairing (SSP) for seamless iOS pairing
 - **BT RSSI Monitoring** — Reads Bluetooth signal strength every 10s when A2DP is active
+---
 
-## Hardware Requirements
+## What this repository is
 
 - ESP32-WROOM-32 or compatible module
 - I2S DAC (e.g., MAX98357A, PCM5102A)
 - Speaker/amplifier
 
-### Default I2S Pin Configuration
+This repository is the transport-facing and control-bridging component of the 42dB platform.
 
-| Signal | GPIO |
-|--------|------|
-| BCK (Bit Clock) | GPIO26 |
-| WS (Word Select/LRCK) | GPIO25 |
-| DATA (Serial Data) | GPIO22 |
+Its role is to:
+
+- receive Bluetooth audio
+- forward audio over I2S toward the DSP engine
+- expose the BLE GATT control interface
+- relay control updates over UART toward the DSP engine
+- reflect device state back toward the companion app
+- manage settings persistence and update-related coordination where needed
 
 ### UART to External DSP (STM32)
 
@@ -43,48 +53,47 @@ GATT commands received via BLE are echoed as `GATT:CTRL:<hex>\r\n` on GPIO4 @ 11
 
 ## Software Requirements
 
-- ESP-IDF v6.0-beta1 or later
-- Python 3.8+
+This repository is **not** the main DSP implementation and is **not** the companion app.
 
-## Building
+---
 
-```bash
-# Set up ESP-IDF environment
-source ~/esp/esp-idf/export.sh
+## Role in the 42dB platform
 
-# Configure target
-idf.py set-target esp32
+The 42dB platform is split into a few clear layers:
 
-# Build
-idf.py build
+- **ChaoticVolt-42dB-Companion-App** — user-facing control on iPhone, iPad, and Apple Watch
+- **ChaoticVolt-BLE-I2S-Bridge** — BLE control bridge and audio transport-facing component
+- **ChaoticVolt-42dB-DSP-Engine** — real-time DSP processing layer
+- downstream **DAC / output stage** — conversion and playback
 
-# Flash
-idf.py -p /dev/ttyUSB0 flash
+This repository exists to keep the transport and protocol-facing responsibilities separate from the DSP engine itself.
 
-# Monitor serial output
-idf.py -p /dev/ttyUSB0 monitor
-```
+---
 
-### Creating a Merged Binary
+## At a glance
 
-For flashing without ESP-IDF tools:
+- **Role:** bridge layer for Bluetooth audio ingress and BLE control
+- **Audio path:** Bluetooth audio -> bridge -> I2S -> DSP engine
+- **Control path:** companion app -> BLE GATT -> bridge -> UART -> DSP engine
+- **Downstream integration:** `ChaoticVolt-42dB-DSP-Engine`
+- **Status:** active platform component
 
-```bash
-idf.py merge-bin
-# Creates build/merged-binary.bin
-# Flash at offset 0x0
-```
+---
 
-## Usage
+## Core responsibilities
 
-### Bluetooth Audio (A2DP)
+### Bluetooth audio ingress
+
+The bridge receives Bluetooth audio and forwards the digital audio stream toward the DSP engine over I2S.
 
 1. Power on the ESP32
 2. Search for **"42 Decibels"** in your device's Bluetooth settings
 3. Pair and connect
 4. Play audio — it streams to the I2S DAC
 
-### DSP Control (BLE GATT)
+### BLE GATT control
+
+The bridge exposes the BLE GATT interface used by the companion app for settings, control, and state synchronization.
 
 Use any BLE app (nRF Connect, LightBlue) or the 42 Decibels iOS app:
 
@@ -391,3 +400,70 @@ Robin Kluit
 ## Maintenance
 
 This repo currently does not accept external pull requests. Please use Issues or Discussions for reports and suggestions.
+
+### UART control relay
+
+Control updates destined for the DSP engine are translated and forwarded over UART or an equivalent low-level control path.
+
+### State reflection
+
+The bridge helps keep the user-facing control layer aligned with device reality by reflecting relevant status back toward BLE clients.
+
+### Settings and update coordination
+
+Where needed, the bridge may also participate in settings persistence, OTA-related coordination, and other platform glue responsibilities.
+
+---
+
+## Architectural intent
+
+This repository represents an architectural transition away from older all-in-one implementations.
+
+Earlier iterations may have concentrated more roles inside one ESP32-based codebase, including DSP-adjacent behavior. The current role of this project is narrower and cleaner:
+
+- audio transport-facing integration
+- BLE control handling
+- bridge logic
+- state synchronization
+- downstream handoff to the DSP engine
+
+The DSP engine now lives in its own dedicated repository:
+
+- **ChaoticVolt-42dB-DSP-Engine**
+
+That separation is intentional and should remain visible throughout the repo.
+
+---
+
+## Platform relationship
+
+This repository makes the most sense when viewed together with:
+
+- **ChaoticVolt-42dB-Companion-App**
+- **ChaoticVolt-42dB-DSP-Engine**
+
+Together, these repositories form the user-facing control path, the bridge layer, and the real-time DSP path of the 42dB platform.
+
+---
+
+## Documentation
+
+See the `docs/` directory for deeper technical documentation.
+
+Suggested core documents:
+
+- `docs/overview.md` — repository summary and role in the platform
+- `docs/architecture.md` — system layout and bridge-layer responsibilities
+- `docs/audio-path.md` — Bluetooth audio ingress and I2S handoff
+- `docs/control-path.md` — BLE GATT, UART relay, and state synchronization
+- `docs/protocol.md` — BLE-facing control protocol and message structure
+- `docs/development-notes.md` — prototype history, transitions, and practical constraints
+
+---
+
+## Notes
+
+This repository is a bridge and integration component.
+
+It should be presented as a stable architectural role within the 42dB platform, even if the exact hardware partitioning and transport-side implementation details continue to evolve.
+
