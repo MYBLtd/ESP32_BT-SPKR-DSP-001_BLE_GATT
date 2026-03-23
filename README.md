@@ -1,11 +1,3 @@
-# ESP32 A2DP Bluetooth Sink with BLE GATT Relay
-
-Bluetooth A2DP audio receiver and BLE GATT relay for the 42 Decibels audio platform. The ESP32 receives audio over Bluetooth (A2DP) and forwards it via I2S to the STM32 DSP engine. BLE GATT commands from the 42 Decibels app are forwarded to the STM32 over UART — all DSP processing runs on the STM32.
-
-> **Note:** Prior to v2.4.0 this firmware included its own DSP processing chain (biquad EQ, loudness, normalizer, limiter). That code was removed in v2.4.0 when DSP was moved to the dedicated STM32 DSP engine. See [Legacy: ESP32-side DSP (≤ v2.3.1)](#legacy-esp32-side-dsp--v231) below.
-
-**Version:** 2.4.3 | **Date:** 2026-02-18
-
 # ChaoticVolt BLE-I2S Bridge
 
 Bluetooth A2DP and BLE GATT bridge for the ChaoticVolt 42dB platform, relaying audio over I2S and control over UART to the DSP engine.
